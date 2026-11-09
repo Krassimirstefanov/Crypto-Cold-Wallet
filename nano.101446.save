@@ -1,0 +1,2705 @@
+#!/usr/bin/env python3
+"""
+menu.py — Interface interactive principale du gestionnaire de wallets crypto locaux.
+Orchestre : création, liste/balances, transfert (en $ ou crypto, conversion marché),
+et décryptage (un wallet ou tous).
+
+Usage :
+    python menu.py
+Le script compile/importe wallet_manager.py et transfer.py (présents dans le dossier).
+"""
+
+import importlib.util
+import json
+import os
+import random
+import shutil
+import socket
+import string
+import subprocess
+import sys
+import time
+from pathlib import Path
+from getpass import getpass as _getpass
+
+# ─────────────────── Virtual environment bootstrap ───────────────────
+# menu.py may be launched with the system Python (python3 menu.py, ./menu.py,
+# an alias, Bash, Zsh, Termux, etc.). Before importing any project module,
+# automatically restart this process with the Python interpreter from .venv.
+#
+# This is intentionally placed BEFORE imports such as i18n / transfer /
+# wallet_manager, because those modules depend on packages installed in .venv.
+
+_PROJECT_DIR = Path(__file__).resolve().parent
+_VENV_DIR = _PROJECT_DIR / ".venv"
+
+if os.name == "nt":
+    _VENV_PYTHON = _VENV_DIR / "Scripts" / "python.exe"
+else:
+    _VENV_PYTHON = _VENV_DIR / "bin" / "python"
+
+try:
+    _USING_PROJECT_VENV = Path(sys.prefix).resolve() == _VENV_DIR.resolve()
+except OSError:
+    _USING_PROJECT_VENV = False
+
+if not _USING_PROJECT_VENV:
+    if not _VENV_PYTHON.is_file():
+        print(
+            "[!] Environnement virtuel .venv introuvable.\n"
+            f"    Chemin attendu : {_VENV_PYTHON}\n"
+            "    Lance d'abord : ./install.sh",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    if not os.access(_VENV_PYTHON, os.X_OK):
+        print(
+            "[!] Le Python de .venv existe mais n'est pas exécutable :\n"
+            f"    {_VENV_PYTHON}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    # Replace the current process. sys.argv is preserved, including options
+    # passed to menu.py. This works from Bash, Zsh, sh and Termux because the
+    # shell is no longer involved after Python has started.
+    os.execv(
+        str(_VENV_PYTHON),
+        [str(_VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
+# ─────────────────────────────────────────────────────────────────────
+
+import i18n
+from i18n import t, t_en, set_lang, get_lang, LANGS
+import security_core as sec
+import security_access as access
+import transfer
+from asset_catalog import (ASSETS, creation_entries, broadcast_entries,
+                           get as get_asset, asset_icon, network_icon,
+                           catalog_label)
+
+# Drapeau unicode associé à chaque code de langue (affiché à droite du titre)
+LANG_FLAGS = {
+    "fr": "\U0001F1EB\U0001F1F7",  # 🇫🇷
+    "en": "\U0001F1EC\U0001F1E7",  # 🇬🇧
+    "es": "\U0001F1EA\U0001F1F8",  # 🇪🇸
+    "ru": "\U0001F1F7\U0001F1FA",  # 🇷🇺
+    "zh": "\U0001F1E8\U0001F1F3",  # 🇨🇳
+    "ar": "\U0001F1F8\U0001F1E6",  # 🇸🇦
+    "he": "\U0001F1EE\U0001F1F1",  # 🇮🇱
+    "de": "🇩🇪", "it": "🇮🇹", "pt": "🇵🇹", "ja": "🇯🇵",
+    "ko": "🇰🇷", "nl": "🇳🇱", "pl": "🇵🇱", "tr": "🇹🇷",
+}
+
+def get_secret(prompt: str) -> str:
+    """Lit un secret sans l'afficher (getpass en TTY, input sinon)."""
+    try:
+        return _getpass(prompt)
+    except (EOFError, OSError):
+        return input(prompt)
+
+
+def clear_terminal():
+    """Efface l'affichage entre deux rubriques sans toucher aux données."""
+    os.system("cls" if os.name == "nt" else "clear")
+
+BASE = Path(__file__).parent
+WALLET_MANAGER = BASE / "wallet_manager.py"
+TRANSFER = BASE / "transfer.py"
+
+# ───────────────────────── Tor ─────────────────────────
+# Démon Tor (installé via apt) + routage SOCKS via PySocks (pip, dans le venv
+# du dossier). Les requêtes réseau du wallet (prix, soldes, RPC) passent alors
+# par le réseau Tor pour préserver la confidentialité.
+TOR_DATA = BASE / "tor_data"      # DataDirectory de Tor (gitignored)
+TOR_PORT = 9050                   # SocksPort
+TOR_PROC = None                   # subprocess du démon Tor (None = inactif)
+_TOR_ORIG_SOCKET = None           # socket.socket original (restauré à l'arrêt)
+
+# État réseau global (toute l'application)
+WEB_ENABLED = True                # Réseau Web : True = actif (vert), False = coupé (rouge)
+NET_KILLED = False                # Coupure globale de tout le réseau (dossier) : True = coupé
+NATIVE_SOCKET = socket.socket     # socket natif de référence (restauré après coupure)
+
+
+# ─────────────────── Symboles de devise (Unicode) ───────────────────
+# Vrais symboles Unicode reconnus pour chaque ticker (source : recherches
+# web — yonilevy/crypto-currency-symbols, unicode-explorer, Wikipedia).
+# Chaque devise a sa propre icône, uniformément dans tous les menus.
+def sym(ticker: str) -> str:
+    """Icône monochrome d'une devise ou d'un couple actif/réseau."""
+    legacy = {"polygon": "POL", "avalanche": "AVAX", "arbitrum": "ETH",
+              "optimism": "ETH"}
+    return asset_icon(legacy.get(str(ticker).lower(), ticker))
+
+
+def icon_cell(value: str, width: int = 2) -> str:
+    """Colonne d'icône stable, indépendamment de la largeur Unicode."""
+    return pad_display(sym(value), width)
+
+
+def wallet_icon(info: dict) -> str:
+    return sym(info.get("asset_id") or info.get("token") or
+               info.get("asset") or info.get("network"))
+
+
+# ── Alignement visuel des icônes (largeur d'affichage réelle) ──
+# Les terminaux affichent certains glyphes sur 2 colonnes (CJK, emoji astraux,
+# paires de drapeaux, et combinaisons avec sélecteur de variante U+FE0F).
+# On calcule la largeur d'affichage pour aligner les icônes à droite de façon
+# identique dans toutes les langues, au lieu de compter les caractères (len()).
+import unicodedata
+
+def disp_width(s: str) -> int:
+    """Largeur d'affichage réelle d'une chaîne dans un terminal monospace."""
+    chars = list(s)
+    w = 0
+    i = 0
+    n = len(chars)
+    while i < n:
+        c = chars[i]
+        o = ord(c)
+        # Sélecteur de variante (U+FE0F) : largeur nulle, combine avec le précédent
+        if o == 0xFE0F:
+            i += 1
+            continue
+        # Paire de drapeaux (Regional Indicators U+1F1E6..U+1F1FF) -> 2 colonnes
+        if 0x1F1E6 <= o <= 0x1F1FF:
+            if i + 1 < n and 0x1F1E6 <= ord(chars[i + 1]) <= 0x1F1FF:
+                w += 2
+                i += 2
+                continue
+            w += 1
+            i += 1
+            continue
+        # Emoji de plan astral (>= U+10000) : 2 colonnes
+        if o > 0xFFFF:
+            w += 2
+            i += 1
+            continue
+        # Caractère suivi d'un sélecteur de variante -> traité comme emoji (2 colonnes)
+        if i + 1 < n and ord(chars[i + 1]) == 0xFE0F:
+            w += 2
+            i += 2
+            continue
+        # Est-asiatique large / pleine largeur : 2 colonnes
+        if unicodedata.east_asian_width(c) in ("W", "F"):
+            w += 2
+        else:
+            w += 1
+        i += 1
+    return w
+
+
+def pad_display(text: str, width: int) -> str:
+    """Complète `text` avec des espaces jusqu'à `width` colonnes d'affichage."""
+    pad = width - disp_width(text)
+    return text + (" " * pad if pad > 0 else "")
+
+
+# Largeurs cibles d'alignement (colonnes d'affichage)
+# PAD_OPT doit couvrir le libellé le plus large toutes langues confondues
+# (ru "1) Включить Tor (маршрутизация трафика кошелька)" = 48 colonnes).
+PAD_OPT = 48    # rubriques de menu (texte + marge avant l'icône)
+PAD_LANG = 14   # nom de langue dans le menu Langue (max "中文 (普通话)" = 13)
+
+
+def _load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def load_wm():
+    return _load_module("wallet_manager", WALLET_MANAGER)
+
+
+def load_transfer():
+    return _load_module("transfer", TRANSFER)
+
+
+# ───────────────────────── Sécurité / passphrase ─────────────────────
+_SECURITY_TEXT = {
+    "fr": {
+        "title": "🔐 MODE DE SÉCURITÉ",
+        "std": "1) Standard   — Argon2id 64 MiB / 2 passes + AES-256-GCM",
+        "rein": "2) Renforcé — Argon2id 128 MiB / 3 passes + AES-256-GCM (recommandé)",
+        "max": "3) Maximum   — Argon2id 256 MiB / 4 passes + AES-256-GCM",
+        "mode": "Mode : ",
+        "pw_title": "🔑 PHRASE DE PASSE MAÎTRE",
+        "gen": "1) Générer automatiquement une phrase de passe de 24 mots",
+        "custom": "2) Choisir ma propre phrase de passe",
+        "choice": "Choix : ",
+        "generated": "Phrase générée :",
+        "warning": "⚠️  Elle ne sera JAMAIS enregistrée. Copiez-la hors de cet appareil.",
+        "ack": "Appuyez sur Entrée seulement après l'avoir sauvegardée : ",
+        "enter": "Phrase de passe maître : ",
+        "confirm": "Confirmez la phrase de passe : ",
+        "weak": "Phrase trop faible : utilisez au moins 5 mots/24 caractères, ou 16 caractères complexes.",
+        "mismatch": "Les deux saisies diffèrent.",
+        "invalid": "Choix invalide.",
+    },
+    "en": {
+        "title": "🔐 SECURITY MODE",
+        "std": "1) Standard   — Argon2id 64 MiB / 2 passes + AES-256-GCM",
+        "rein": "2) Reinforced — Argon2id 128 MiB / 3 passes + AES-256-GCM (recommended)",
+        "max": "3) Maximum    — Argon2id 256 MiB / 4 passes + AES-256-GCM",
+        "mode": "Mode: ", "pw_title": "🔑 MASTER PASSPHRASE",
+        "gen": "1) Automatically generate a 24-word passphrase",
+        "custom": "2) Choose my own passphrase", "choice": "Choice: ",
+        "generated": "Generated passphrase:",
+        "warning": "⚠️  It will NEVER be saved. Copy it outside this device.",
+        "ack": "Press Enter only after saving it: ", "enter": "Master passphrase: ",
+        "confirm": "Confirm passphrase: ",
+        "weak": "Passphrase too weak: use at least 5 words/24 characters, or 16 complex characters.",
+        "mismatch": "The two entries do not match.", "invalid": "Invalid choice.",
+    },
+    "es": {
+        "title": "🔐 MODO DE SEGURIDAD",
+        "std": "1) Estándar   — Argon2id 64 MiB / 2 pasadas + AES-256-GCM",
+        "rein": "2) Reforzado — Argon2id 128 MiB / 3 pasadas + AES-256-GCM (recomendado)",
+        "max": "3) Máximo     — Argon2id 256 MiB / 4 pasadas + AES-256-GCM",
+        "mode": "Modo: ", "pw_title": "🔑 FRASE MAESTRA",
+        "gen": "1) Generar automáticamente una frase de 24 palabras",
+        "custom": "2) Elegir mi propia frase", "choice": "Elección: ",
+        "generated": "Frase generada:",
+        "warning": "⚠️  NUNCA se guardará. Cópiela fuera de este dispositivo.",
+        "ack": "Pulse Enter solo después de guardarla: ", "enter": "Frase maestra: ",
+        "confirm": "Confirme la frase: ",
+        "weak": "Frase demasiado débil: use al menos 5 palabras/24 caracteres o 16 caracteres complejos.",
+        "mismatch": "Las dos entradas no coinciden.", "invalid": "Elección no válida.",
+    },
+    "ru": {
+        "title": "🔐 РЕЖИМ БЕЗОПАСНОСТИ",
+        "std": "1) Стандартный — Argon2id 64 MiB / 2 прохода + AES-256-GCM",
+        "rein": "2) Усиленный   — Argon2id 128 MiB / 3 прохода + AES-256-GCM (рекомендуется)",
+        "max": "3) Максимальный — Argon2id 256 MiB / 4 прохода + AES-256-GCM",
+        "mode": "Режим: ", "pw_title": "🔑 МАСТЕР-ФРАЗА",
+        "gen": "1) Автоматически создать фразу из 24 слов",
+        "custom": "2) Выбрать собственную фразу", "choice": "Выбор: ",
+        "generated": "Сгенерированная фраза:",
+        "warning": "⚠️  Она НИКОГДА не сохраняется. Скопируйте её вне этого устройства.",
+        "ack": "Нажмите Enter только после сохранения: ", "enter": "Мастер-фраза: ",
+        "confirm": "Подтвердите фразу: ",
+        "weak": "Слишком слабая фраза: минимум 5 слов/24 символа или 16 сложных символов.",
+        "mismatch": "Введённые фразы не совпадают.", "invalid": "Неверный выбор.",
+    },
+    "zh": {
+        "title": "🔐 安全模式",
+        "std": "1) 标准 — Argon2id 64 MiB / 2 次 + AES-256-GCM",
+        "rein": "2) 加强 — Argon2id 128 MiB / 3 次 + AES-256-GCM（推荐）",
+        "max": "3) 最高 — Argon2id 256 MiB / 4 次 + AES-256-GCM",
+        "mode": "模式：", "pw_title": "🔑 主密码短语",
+        "gen": "1) 自动生成 24 个单词的密码短语", "custom": "2) 使用自己的密码短语",
+        "choice": "选择：", "generated": "生成的密码短语：",
+        "warning": "⚠️  它绝不会被保存。请复制到此设备之外。",
+        "ack": "保存后再按 Enter：", "enter": "主密码短语：", "confirm": "确认密码短语：",
+        "weak": "密码短语太弱：至少 5 个词/24 个字符，或 16 个复杂字符。",
+        "mismatch": "两次输入不一致。", "invalid": "无效选择。",
+    },
+    "ar": {
+        "title": "🔐 وضع الأمان",
+        "std": "1) قياسي — Argon2id 64 MiB / جولتان + AES-256-GCM",
+        "rein": "2) معزز — Argon2id 128 MiB / 3 جولات + AES-256-GCM (موصى به)",
+        "max": "3) أقصى — Argon2id 256 MiB / 4 جولات + AES-256-GCM",
+        "mode": "الوضع: ", "pw_title": "🔑 عبارة المرور الرئيسية",
+        "gen": "1) إنشاء عبارة مرور من 24 كلمة تلقائياً", "custom": "2) اختيار عبارة مرور خاصة بي",
+        "choice": "الاختيار: ", "generated": "عبارة المرور المولدة:",
+        "warning": "⚠️  لن يتم حفظها أبداً. انسخها خارج هذا الجهاز.",
+        "ack": "اضغط Enter فقط بعد حفظها: ", "enter": "عبارة المرور الرئيسية: ",
+        "confirm": "تأكيد عبارة المرور: ",
+        "weak": "عبارة المرور ضعيفة: استخدم 5 كلمات/24 محرفاً على الأقل أو 16 محرفاً معقداً.",
+        "mismatch": "العبارتان غير متطابقتين.", "invalid": "اختيار غير صالح.",
+    },
+    "he": {
+        "title": "🔐 מצב אבטחה",
+        "std": "1) רגיל — Argon2id 64 MiB / 2 מעברים + AES-256-GCM",
+        "rein": "2) מחוזק — Argon2id 128 MiB / 3 מעברים + AES-256-GCM (מומלץ)",
+        "max": "3) מרבי — Argon2id 256 MiB / 4 מעברים + AES-256-GCM",
+        "mode": "מצב: ", "pw_title": "🔑 סיסמת מאסטר",
+        "gen": "1) יצירה אוטומטית של סיסמה בת 24 מילים", "custom": "2) בחירת סיסמה אישית",
+        "choice": "בחירה: ", "generated": "הסיסמה שנוצרה:",
+        "warning": "⚠️  היא לעולם לא תישמר. העתק אותה מחוץ למכשיר.",
+        "ack": "לחץ Enter רק לאחר ששמרת אותה: ", "enter": "סיסמת מאסטר: ",
+        "confirm": "אשר את הסיסמה: ",
+        "weak": "הסיסמה חלשה מדי: לפחות 5 מילים/24 תווים או 16 תווים מורכבים.",
+        "mismatch": "שתי ההקלדות אינן תואמות.", "invalid": "בחירה לא תקינה.",
+    },
+}
+
+def _st(key: str) -> str:
+    lang = get_lang() if get_lang() in _SECURITY_TEXT else "en"
+    return _SECURITY_TEXT[lang][key]
+
+def generate_passphrase(words: int = 24) -> str:
+    """Générateur cryptographiquement sûr; 24 mots BIP39 (256 bits)."""
+    return sec.generate_passphrase()
+
+def choose_security_mode() -> str:
+    print("\n" + _st("title"))
+    print("  " + _st("std"))
+    print("  " + _st("rein"))
+    print("  " + _st("max"))
+    while True:
+        raw = input("  " + _st("mode")).strip()
+        mode = {"1": "standard", "2": "reinforced", "3": "maximum"}.get(raw)
+        if mode:
+            return mode
+        print("  [!] " + _st("invalid"))
+
+def ask_passphrase() -> str:
+    """Choisit génération automatique ou saisie utilisateur, jamais stockée."""
+    print("\n" + _st("pw_title"))
+    print("  " + _st("gen"))
+    print("  " + _st("custom"))
+    while True:
+        choix = input("  " + _st("choice")).strip()
+        if choix == "1":
+            pwd = sec.generate_passphrase()
+            print("\n  " + _st("generated"))
+            print("\n  " + pwd + "\n")
+            print("  " + _st("warning"))
+            input("  " + _st("ack"))
+            return pwd
+        if choix == "2":
+            while True:
+                pwd = get_secret("  " + _st("enter"))
+                if not sec.check_passphrase_strength(pwd):
+                    print("  [!] " + _st("weak"))
+                    continue
+                pwd2 = get_secret("  " + _st("confirm"))
+                if pwd != pwd2:
+                    print("  [!] " + _st("mismatch"))
+                    continue
+                return pwd
+        print("  [!] " + _st("invalid"))
+
+
+# ───────────────────────── Prix marché ─────────────────────────
+def get_prices_usd():
+    """Récupère les prix USD via CoinGecko (lecture seule, publique)."""
+    try:
+        import requests
+        url = ("https://api.coingecko.com/api/v3/simple/price"
+               "?ids=bitcoin,ethereum,solana,litecoin,dogecoin,binancecoin,tether,"
+               "usd-coin,dai,polygon-ecosystem-token,avalanche-2,arbitrum,optimism,"
+               "ripple,tron,cosmos,cardano,monero,the-sandbox,shiba-inu,"
+               "official-trump&vs_currencies=usd")
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        d = r.json()
+        import math
+        ids = {'btc': 'bitcoin', 'eth': 'ethereum', 'sol': 'solana', 'ltc': 'litecoin', 'doge': 'dogecoin', 'bnb': 'binancecoin', 'usdt': 'tether', 'usdc': 'usd-coin', 'dai': 'dai', 'polygon': 'polygon-ecosystem-token', 'avalanche': 'avalanche-2', 'arbitrum': 'arbitrum', 'optimism': 'optimism', 'xrp': 'ripple', 'trx': 'tron', 'atom': 'cosmos', 'ada': 'cardano', 'xmr': 'monero', 'sand': 'the-sandbox', 'shib': 'shiba-inu', 'trump': 'official-trump'}
+        if not isinstance(d, dict):
+            raise ValueError("Invalid price response")
+        prices = {}
+        for symbol, coin_id in ids.items():
+            entry = d.get(coin_id)
+            value = entry.get("usd") if isinstance(entry, dict) else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if math.isfinite(value) and value >= 0:
+                    prices[symbol] = float(value)
+        if not prices:
+            raise ValueError("No USD prices available in API response")
+        return prices
+    except Exception as e:
+        print("  " + t("prices_unavail", e=e))
+        return None
+
+
+# ───────────────────────── Menus ─────────────────────────
+def menu_create(master_pw: str):
+    wm = load_wm()
+    print("\n" + t("create_title"))
+    print("  " + t("create_supported"))
+    # Une entrée par réseau/actif. L'utilisateur choisit uniquement avec le
+    # pavé numérique : aucune ambiguïté de ticker ni faute de frappe possible.
+    networks = creation_entries()
+    print("─" * 50)
+    for number, (asset_id, spec) in enumerate(networks, 1):
+        print(f"  {number:>2}) {catalog_label(asset_id)}")
+    print("  " + t("tx_back"))
+    print("─" * 50)
+
+    raw_choice = input(t("choice_prompt")).strip()
+    if raw_choice == "0":
+        return
+    if not raw_choice.isdigit() or not 1 <= int(raw_choice) <= len(networks):
+        print("  " + t("create_unknown"))
+        return
+    asset_id, spec = networks[int(raw_choice) - 1]
+    label = input("  " + t("create_label_prompt")).strip() or f"{asset_id}_{os.urandom(3).hex()}"
+    passphrase = master_pw
+    data = wm.generate_catalog_wallet(label, asset_id, spec)
+    level = access.get_access_level()
+    if level == "advanced":
+        # Advanced includes every Medium control before the wallet-specific
+        # passphrase is created.
+        if not access.verify_secondary(master_pw):
+            print("! Wallet creation cancelled: secondary authentication failed.")
+            return
+        wallet_phrase = access.ask_wallet_passphrase(label)
+        data = access.protect_wallet_secrets(data, wallet_phrase)
+        del wallet_phrase
+    elif level == "medium":
+        secondary = access.get_verified_secondary(master_pw)
+        if secondary is None:
+            print("! Wallet creation cancelled: secondary authentication failed.")
+            return
+        # Vérifie la seconde saisie en tentant la validation complète avant de
+        # l'utiliser comme clé de chiffrement des secrets du wallet.
+        data = access.protect_wallet_secrets(data, secondary, protection="secondary")
+        del secondary
+    wallets = wm.load_wallets(passphrase)
+    wallets[label] = data
+    wm.save_wallets(wallets, passphrase)
+    print(t("create_done", label=label, net=spec['name']))
+    print(t("create_addr", addr=data['address']))
+    print("  " + t("create_keep"))
+
+
+def menu_show_balances(master_pw: str):
+    if access.get_access_level() in {"medium", "advanced"} and not access.verify_secondary(master_pw):
+        return
+    """Affiche les soldes en distinguant l'actif du réseau.
+
+    Important : un token (USDT/USDC/DAI/HSH...) doit être lu via son contrat,
+    même si son réseau est Ethereum ou BSC. L'ancienne version testait le réseau
+    avant le token, ce qui faisait par exemple lire de l'ETH à la place d'USDT.
+    """
+    wm = load_wm()
+    wallets = wm.load_wallets(master_pw)
+    if not wallets:
+        print("  " + t("no_wallet")); return
+
+    prices = get_prices_usd()
+
+    # Tableau compact : l'adresse complète est placée sur une seconde ligne.
+    # Cela évite que les adresses longues (notamment Monero) décalent le solde.
+    label_width = 20
+    asset_width = 8
+    balance_width = 24
+    value_width = 18
+
+    def fit(value, width):
+        """Tronque selon la largeur terminal réelle, puis complète d'espaces."""
+        value = str(value)
+        if disp_width(value) <= width:
+            return pad_display(value, width)
+        out = ""
+        for char in value:
+            if disp_width(out + char + "…") > width:
+                break
+            out += char
+        return pad_display(out + "…", width)
+
+    def print_balance_row(icon, label, asset, balance_text, value_text, address,
+                          network="", detail=""):
+        icon_col = pad_display(icon, 2)
+        print(
+            f"  {icon_col} {fit(label, label_width)} │ "
+            f"{fit(asset, asset_width)} │ {fit(balance_text, balance_width)} │ "
+            f"{fit(value_text, value_width)}"
+        )
+        network_part = (f"{pad_display(network_icon(network), 2)} {network}  ·  "
+                        if network else "")
+        print(f"     └─ {network_part}{t('bal_col_address')} : {address}")
+        if detail:
+            print(f"        {detail}")
+
+    print("\n" + t("balances_hdr"))
+    print("─" * 103)
+    print(
+        f"     {fit(t('bal_col_label'), label_width)} │ "
+        f"{fit(t('bal_col_asset'), asset_width)} │ "
+        f"{fit(t('bal_col_balance'), balance_width)} │ "
+        f"{fit(t('bal_col_value'), value_width)}"
+    )
+    print("─" * 103)
+
+    net_map = {
+        "bitcoin": ("BTC", "btc"), "ethereum": ("ETH", "eth"),
+        "solana": ("SOL", "sol"), "litecoin": ("LTC", "ltc"),
+        "dogecoin": ("DOGE", "doge"), "bsc": ("BNB", "bnb"),
+        "polygon": ("POL", "polygon"), "avalanche": ("AVAX", "avalanche"),
+        # Arbitrum One et OP Mainnet paient le gas en ETH.
+        "arbitrum": ("ETH", "arbitrum"), "optimism": ("ETH", "optimism"),
+        "ripple": ("XRP", "xrp"), "tron": ("TRX", "trx"),
+        "cosmos": ("ATOM", "atom"), "cardano": ("ADA", "ada"),
+        "monero": ("XMR", "xmr"),
+    }
+
+    for label, info in wallets.items():
+        net = str(info.get("network", "?")).lower()
+        addr = info.get("address", "?")
+        token = str(info.get("token") or info.get("asset") or "").upper()
+        catalog_spec = get_asset(str(info.get("asset_id", "")))
+
+        if access.get_access_level() == "advanced":
+            if not access.verify_five_words(info):
+                print_balance_row(wallet_icon(info), label, "?", t("bal_unavail"),
+                                  "—", addr, net, "Advanced verification failed")
+                continue
+
+        # PRIORITÉ AU TOKEN : réseau et actif sont deux notions différentes.
+        if catalog_spec:
+            name = catalog_spec["asset"]
+            read_key = info["asset_id"]
+            bal = _read_catalog_balance(catalog_spec, addr)
+            price_key = {"pol": "polygon"}.get(name.lower(), name.lower())
+        elif token in ("USDT", "USDC", "DAI", "HSH"):
+            name = token
+            read_key = token.lower()
+            bal = _read_balance(read_key, addr)
+            price_key = token.lower()
+        elif net in net_map:
+            name, read_key = net_map[net]
+            bal = _read_balance(read_key, addr)
+            price_key = _net_to_price(net)
+        else:
+            name, read_key, bal, price_key = "?", None, None, None
+
+        icon = sym(read_key) if read_key else "?"
+        if bal is None:
+            reason = _balance_unavailable_reason(read_key)
+            print_balance_row(icon, label, name, t("bal_unavail"), "—", addr,
+                              net, reason)
+        else:
+            usd_price = prices.get(price_key, 0) if prices and price_key else 0
+            usd = bal * usd_price
+            if prices and usd_price:
+                value_text = f"~${usd:,.2f}"
+            else:
+                value_text = "—"
+            print_balance_row(
+                icon, label, name, f"{bal:,.8f} {name}", value_text, addr, net
+            )
+
+        # HSH est un token BEP-20 : un wallet BSC peut détenir simultanément
+        # du BNB et du HSH à la même adresse. Si HSH n'est pas déjà l'actif de
+        # l'entrée, on le détecte et on l'affiche uniquement si le solde > 0.
+        if net == "bsc" and token != "HSH":
+            hsh_bal = _read_balance("hsh", addr)
+            if hsh_bal is not None and hsh_bal > 0:
+                print_balance_row(
+                    sym("hsh"), "↳ HSH", "HSH", f"{hsh_bal:,.8f} HSH", "—", addr,
+                    "bsc"
+                )
+
+    print("─" * 103)
+
+
+def _balance_unavailable_reason(read_key):
+    if not read_key:
+        return t("bal_reason_unconfigured")
+    if read_key == "xmr":
+        return t("bal_reason_xmr")
+    if read_key == "ada":
+        return t("bal_reason_ada")
+    return t("bal_reason_rpc")
+
+def _net_to_price(net):
+    return {"bitcoin": "btc", "ethereum": "eth", "solana": "sol",
+            "litecoin": "ltc", "dogecoin": "doge", "bsc": "bnb",
+            "ethereum_token": "token", "polygon": "polygon", "avalanche": "avalanche",
+            "arbitrum": "eth", "optimism": "eth",
+            "ripple": "xrp", "tron": "trx", "cosmos": "atom", "cardano": "ada",
+            "monero": "xmr",
+            "usdc": "usdc", "dai": "dai", "usdt": "usdt", "hsh": "hsh"}.get(net)
+
+
+def _read_balance(net, addr):
+    """Lit le solde via l'API publique (même logique que balance.py)."""
+    try:
+        import requests
+        if net == "btc":
+            r = requests.get(f"https://blockchain.info/balance?active={addr}", timeout=15)
+            return r.json().get("balance", 0) / 1e8
+        elif net == "eth":
+            for rpc in ["https://ethereum-rpc.publicnode.com", "https://rpc.mevblocker.io",
+                        "https://rpc.ankr.com/eth"]:
+                try:
+                    r = requests.post(rpc, json={"jsonrpc": "2.0", "method": "eth_getBalance",
+                                                 "params": [addr, "latest"], "id": 1}, timeout=10)
+                    res = r.json().get("result")
+                    if res:
+                        return int(res, 16) / 1e18
+                except Exception:
+                    continue
+            return None
+        elif net == "usdt":
+            # USDT ERC-20 sur Ethereum
+            contract = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+            for rpc in ["https://ethereum-rpc.publicnode.com", "https://rpc.mevblocker.io"]:
+                try:
+                    addr_padded = addr.lower().replace("0x", "").rjust(64, "0")
+                    data = "0x70a08231" + addr_padded
+                    r = requests.post(rpc, json={"jsonrpc": "2.0", "method": "eth_call",
+                                                 "params": [{"to": contract, "data": data}, "latest"],
+                                                 "id": 1}, timeout=10)
+                    res = r.json().get("result")
+                    if res:
+                        return int(res, 16) / 1e6
+                except Exception:
+                    continue
+            return None
+        elif net == "hsh":
+            # HashCoin HSH — BEP-20 sur BNB Smart Chain.
+            contract = "0xA07eb39d960C8F1787A5B684874d2Fd897E623FA"
+            addr_padded = addr.lower().replace("0x", "").rjust(64, "0")
+            data = "0x70a08231" + addr_padded
+            # Plusieurs RPC : un endpoint public peut être temporairement limité.
+            for rpc in ["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.binance.org/", "https://1rpc.io/bnb"]:
+                try:
+                    r = requests.post(rpc, json={"jsonrpc": "2.0", "method": "eth_call",
+                                                 "params": [{"to": contract, "data": data}, "latest"],
+                                                 "id": 1}, timeout=10)
+                    res = r.json().get("result")
+                    if res is not None:
+                        # Le contrat HSH expose 18 décimales.
+                        return int(res, 16) / 1e18
+                except Exception:
+                    continue
+            return None
+        elif net == "bnb":
+            for rpc in ["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.binance.org/", "https://1rpc.io/bnb"]:
+                try:
+                    r = requests.post(rpc, json={"jsonrpc": "2.0", "method": "eth_getBalance",
+                                                 "params": [addr, "latest"], "id": 1}, timeout=10)
+                    res = r.json().get("result")
+                    if res is not None:
+                        return int(res, 16) / 1e18
+                except Exception:
+                    continue
+            return None
+        elif net in ("polygon", "avalanche", "arbitrum", "optimism"):
+            rpcs = {"polygon": "https://polygon-bor-rpc.publicnode.com",
+                    "avalanche": "https://api.avax.network/ext/bc/C/rpc",
+                    "arbitrum": "https://arb1.arbitrum.io/rpc",
+                    "optimism": "https://mainnet.optimism.io"}
+            try:
+                r = requests.post(rpcs[net], json={"jsonrpc": "2.0", "method": "eth_getBalance",
+                                                   "params": [addr, "latest"], "id": 1}, timeout=10)
+                res = r.json().get("result")
+                if res:
+                    return int(res, 16) / 1e18
+            except Exception:
+                return None
+        elif net == "usdc":
+            contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            for rpc in ["https://ethereum-rpc.publicnode.com", "https://rpc.mevblocker.io"]:
+                try:
+                    addr_padded = addr.lower().replace("0x", "").rjust(64, "0")
+                    data = "0x70a08231" + addr_padded
+                    r = requests.post(rpc, json={"jsonrpc": "2.0", "method": "eth_call",
+                                                 "params": [{"to": contract, "data": data}, "latest"], "id": 1}, timeout=10)
+                    res = r.json().get("result")
+                    if res:
+                        return int(res, 16) / 1e6
+                except Exception:
+                    continue
+            return None
+        elif net == "dai":
+            contract = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+            for rpc in ["https://ethereum-rpc.publicnode.com", "https://rpc.mevblocker.io"]:
+                try:
+                    addr_padded = addr.lower().replace("0x", "").rjust(64, "0")
+                    data = "0x70a08231" + addr_padded
+                    r = requests.post(rpc, json={"jsonrpc": "2.0", "method": "eth_call",
+                                                 "params": [{"to": contract, "data": data}, "latest"], "id": 1}, timeout=10)
+                    res = r.json().get("result")
+                    if res:
+                        return int(res, 16) / 1e18
+                except Exception:
+                    continue
+            return None
+        elif net == "xrp":
+            try:
+                r = requests.get(f"https://data.ripple.com/v2/accounts/{addr}/balances", timeout=15)
+                for b in r.json().get("balances", []):
+                    if b.get("currency") == "XRP":
+                        return float(b.get("value", 0))
+                return 0.0
+            except Exception:
+                return None
+        elif net == "trx":
+            try:
+                import base58
+                raw = base58.b58decode(addr)
+                hex_addr = raw[1:-4].hex()
+                r = requests.get(f"https://api.trongrid.io/v1/accounts/{hex_addr}", timeout=15)
+                return int(r.json().get("data", [{}])[0].get("balance", 0)) / 1e6
+            except Exception:
+                return None
+        elif net == "atom":
+            try:
+                r = requests.get(f"https://rest.cosmos.directory/cosmoshub/bank/balances/{addr}", timeout=15)
+                for b in r.json().get("balances", []):
+                    if b.get("denom") == "uatom":
+                        return int(b.get("amount", 0)) / 1e6
+                return 0.0
+            except Exception:
+                return None
+        elif net == "ada":
+            try:
+                r = requests.get(f"https://cardano-mainnet.blockfrost.io/api/v0/addresses/{addr}", timeout=15)
+                if r.status_code == 200:
+                    return int(r.json().get("amount", 0)) / 1e6
+                return None  # Blockfrost nécessite une clé
+            except Exception:
+                return None
+        elif net in ("ltc", "doge"):
+            api = "https://api.blockchair.com/litecoin" if net == "ltc" \
+                else "https://api.blockchair.com/dogecoin"
+            sym = "LTC" if net == "ltc" else "DOGE"
+            try:
+                r = requests.get(f"{api}/dashboards/address/{addr}", timeout=15)
+                if r.status_code != 200:
+                    raise RuntimeError(f"Blockchair HTTP {r.status_code}")
+                d = r.json()
+                if d.get("data") and addr in d["data"]:
+                    return d["data"][addr][0]["balance"] / 1e8
+                return 0.0
+            except Exception:
+                # Repli BlockCypher (sans clé)
+                try:
+                    bcy = "ltc" if net == "ltc" else "doge"
+                    r2 = requests.get(
+                        f"https://api.blockcypher.com/v1/{bcy}/main/addrs/{addr}/balance",
+                        timeout=15)
+                    if r2.status_code == 200:
+                        return int(r2.json().get("final_balance", 0)) / 1e8
+                except Exception:
+                    pass
+                return None
+        elif net == "sol":
+            r = requests.post("https://api.mainnet-beta.solana.com",
+                              json={"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [addr]},
+                              timeout=15)
+            return r.json().get("result", {}).get("value", 0) / 1e9
+        elif net == "xmr":
+            # Monero : pas d'API publique sans nœud. Le solde est fourni par le
+            # serveur de passerelle (à brancher). On renvoie None -> "indisponible".
+            return None
+    except Exception:
+        return None
+
+
+def _read_catalog_balance(spec, address):
+    """Lecture alignée sur le couple actif/réseau enregistré dans le coffre."""
+    kind = spec.get("kind")
+    if kind == "native":
+        aliases = {"bitcoin": "btc", "ethereum": "eth", "solana": "sol",
+                   "litecoin": "ltc", "dogecoin": "doge", "bsc": "bnb",
+                   "ripple": "xrp", "tron": "trx", "cosmos": "atom",
+                   "cardano": "ada", "monero": "xmr"}
+        return _read_balance(aliases.get(spec["network"], spec["network"]), address)
+    if kind == "evm_token":
+        rpcs = {
+            "ethereum": ["https://ethereum-rpc.publicnode.com", "https://rpc.mevblocker.io"],
+            "bsc": ["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.binance.org/"],
+            "polygon": ["https://polygon-bor-rpc.publicnode.com"],
+        }
+        padded = address.lower().replace("0x", "").rjust(64, "0")
+        for rpc in rpcs.get(spec["network"], []):
+            try:
+                payload = {"jsonrpc": "2.0", "method": "eth_call",
+                           "params": [{"to": spec["contract"],
+                                       "data": "0x70a08231" + padded}, "latest"], "id": 1}
+                result = __import__("requests").post(rpc, json=payload, timeout=10).json().get("result")
+                if result is not None:
+                    return int(result, 16) / (10 ** int(spec["decimals"]))
+            except Exception:
+                continue
+        return None
+    if kind == "spl":
+        try:
+            payload = {"jsonrpc": "2.0", "id": 1,
+                       "method": "getTokenAccountsByOwner",
+                       "params": [address, {"mint": spec["mint"]}, {"encoding": "jsonParsed"}]}
+            values = __import__("requests").post(
+                "https://api.mainnet-beta.solana.com", json=payload, timeout=15
+            ).json().get("result", {}).get("value", [])
+            return sum(float(v["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmountString"])
+                       for v in values)
+        except Exception:
+            return None
+    # TRC-20 : affiché et stocké, mais pas déclaré fonctionnel tant que la
+    # lecture/signature native Tron n'est pas intégrée et vérifiée.
+    return None
+
+
+
+# ───────────────────── Bénéficiaires → transferts ─────────────────────
+# Le carnet de bénéficiaires est volontairement découplé du wallet source :
+# un contact peut posséder plusieurs adresses sur plusieurs réseaux.
+_BENEFICIARIES_FILE = BASE / "beneficiaries.json"
+
+# Réseaux réellement câblés par le moteur de transfert actuel.
+# Pour les tokens, on ne propose que la chaîne effectivement implémentée
+# (USDT/USDC/DAI = Ethereum mainnet dans transfer.py).
+_BENEFICIARY_COMPAT = {
+    "btc":       ({"BTC"}, {"btc", "bitcoin"}),
+    "eth":       ({"ETH"}, {"eth", "ethereum"}),
+    "sol":       ({"SOL"}, {"sol", "solana"}),
+    "ltc":       ({"LTC"}, {"ltc", "litecoin"}),
+    "doge":      ({"DOGE"}, {"doge", "dogecoin"}),
+    "bnb":       ({"BNB"}, {"bnb", "bsc", "bep20", "bnb smart chain"}),
+    "usdt":      ({"USDT"}, {"eth", "ethereum", "erc20", "ethereum mainnet"}),
+    "usdc":      ({"USDC"}, {"eth", "ethereum", "erc20", "ethereum mainnet"}),
+    "dai":       ({"DAI"}, {"eth", "ethereum", "erc20", "ethereum mainnet"}),
+    "polygon":   ({"POL", "MATIC", "POLYGON"}, {"polygon", "matic", "pol"}),
+    "avalanche": ({"AVAX", "AVALANCHE"}, {"avalanche", "avax", "c-chain", "cchain"}),
+    "arbitrum":  ({"ETH", "ARB", "ARBITRUM"}, {"arbitrum", "arb", "arbitrum one"}),
+    "optimism":  ({"ETH", "OP", "OPTIMISM"}, {"optimism", "op", "op mainnet"}),
+    "xrp":       ({"XRP"}, {"xrp", "ripple", "xrpl"}),
+    "trx":       ({"TRX"}, {"trx", "tron"}),
+    "atom":      ({"ATOM"}, {"atom", "cosmos", "cosmos hub"}),
+    "ada":       ({"ADA"}, {"ada", "cardano"}),
+    "xmr":       ({"XMR"}, {"xmr", "monero"}),
+}
+
+_BENEFICIARY_VALIDATION_NET = {
+    "btc": "bitcoin", "eth": "ethereum", "sol": "solana",
+    "ltc": "litecoin", "doge": "dogecoin", "bnb": "bsc",
+    "usdt": "ethereum", "usdc": "ethereum", "dai": "ethereum",
+    "polygon": "polygon", "avalanche": "avalanche",
+    "arbitrum": "arbitrum", "optimism": "optimism",
+    "xrp": "ripple", "trx": "tron", "atom": "cosmos",
+    "ada": "cardano", "xmr": "monero",
+}
+
+
+def _load_beneficiaries_for_transfer(master_pw: str) -> dict:
+    """Charge le carnet de bénéficiaires sans masquer les erreurs de format."""
+    try:
+        import beneficiaries_manager as _bm
+        return _bm.load_beneficiaries(master_pw)
+    except Exception as e:
+        print(f"  [!] Carnet de bénéficiaires illisible : {e}")
+        return {}
+
+
+def _beneficiary_wallet_matches(net: str, wallet: dict) -> bool:
+    """True uniquement si devise ET réseau correspondent au transfert demandé."""
+    spec = get_asset(net)
+    if spec:
+        currency = str(wallet.get("devise", "")).strip().upper()
+        network = str(wallet.get("reseau", "")).strip().lower()
+        aliases = {
+            "ethereum": {"eth", "ethereum", "erc20", "ethereum mainnet"},
+            "bsc": {"bsc", "bnb", "bep20", "bnb smart chain"},
+            "polygon": {"pol", "polygon", "matic"},
+            "solana": {"sol", "solana", "spl"},
+            "tron": {"trx", "tron", "trc20"},
+        }.get(spec["network"], {spec["network"]})
+        return currency == spec["asset"] and network in aliases
+    currencies, networks = _BENEFICIARY_COMPAT.get(net, (set(), set()))
+    currency = str(wallet.get("devise", "")).strip().upper()
+    network = str(wallet.get("reseau", "")).strip().lower()
+    return currency in currencies and network in networks
+
+
+def _choose_beneficiary_destination(net: str, master_pw: str):
+    """Sélection type banque : contact → adresse compatible avec le réseau.
+
+    Retourne (adresse, nom_beneficiaire, wallet_meta) ou None si annulé.
+    Les contacts sans adresse compatible ne sont pas affichés.
+    """
+    benefs = _load_beneficiaries_for_transfer(master_pw)
+    eligible = []
+    for label in sorted(benefs):
+        info = benefs.get(label) or {}
+        wallets = [w for w in info.get("wallets", [])
+                   if isinstance(w, dict) and _beneficiary_wallet_matches(net, w)]
+        if wallets:
+            eligible.append((label, info, wallets))
+
+    if not eligible:
+        print(f"  [!] Aucun bénéficiaire avec une adresse compatible {net.upper()}.")
+        return None
+
+    print("\n  ── Choisir un bénéficiaire ──")
+    for i, (label, info, wallets) in enumerate(eligible, 1):
+        pseudo = str(info.get("pseudonyme", "")).strip()
+        suffix = f" ({pseudo})" if pseudo else ""
+        print(f"  {i}) {label}{suffix} — {len(wallets)} adresse(s) compatible(s)")
+    print("  0) Retour")
+
+    raw = input("  Bénéficiaire : ").strip()
+    try:
+        idx = int(raw)
+    except ValueError:
+        print("  [!] Choix invalide.")
+        return None
+    if idx == 0:
+        return None
+    if not 1 <= idx <= len(eligible):
+        print("  [!] Choix invalide.")
+        return None
+
+    label, info, wallets = eligible[idx - 1]
+    if len(wallets) == 1:
+        chosen = wallets[0]
+    else:
+        print(f"\n  ── Adresses de {label} pour {net.upper()} ──")
+        for i, w in enumerate(wallets, 1):
+            addr = str(w.get("adresse", ""))
+            platform = str(w.get("plateforme", "")).strip() or "Wallet"
+            network = str(w.get("reseau", "")).strip()
+            currency = str(w.get("devise", "")).strip().upper()
+            print(f"  {i}) {icon_cell(currency)} {currency} / "
+                  f"{pad_display(network_icon(network), 2)} {network} / {platform}")
+            print(f"     {addr}")
+        print("  0) Retour")
+        raw = input("  Adresse : ").strip()
+        try:
+            widx = int(raw)
+        except ValueError:
+            print("  [!] Choix invalide.")
+            return None
+        if widx == 0:
+            return None
+        if not 1 <= widx <= len(wallets):
+            print("  [!] Choix invalide.")
+            return None
+        chosen = wallets[widx - 1]
+
+    address = str(chosen.get("adresse", "")).strip()
+    val_net = _BENEFICIARY_VALIDATION_NET.get(net, net)
+    if not transfer.validate_address(val_net, address):
+        print("  [!] Adresse enregistrée invalide pour ce réseau.")
+        print(f"      Bénéficiaire : {label}")
+        print(f"      Adresse      : {address}")
+        return None
+    return address, label, chosen
+
+
+def _choose_transfer_destination(net: str, master_pw: str):
+    """Choisit entre carnet de bénéficiaires et saisie manuelle."""
+    while True:
+        print("\n  Destination :")
+        print("  1) Choisir un bénéficiaire")
+        print("  2) Saisir une adresse manuellement")
+        print("  0) Annuler")
+        choice = input("  Choix : ").strip()
+        if choice == "1":
+            selected = _choose_beneficiary_destination(net, master_pw)
+            if selected is None:
+                continue
+            address, label, wallet = selected
+            return address, label, wallet
+        if choice == "2":
+            address = input("  Adresse destinataire : ").strip()
+            return (address, None, None) if address else None
+        if choice == "0":
+            return None
+        print("  [!] Choix invalide.")
+
+
+# Réseaux dont le moteur de transfert possède actuellement une implémentation
+# de broadcast utilisable. XMR reste volontairement hors de ce parcours tant
+# que son architecture de signature n'a pas été revue.
+_TRANSFER_NETWORKS = [
+    (key, catalog_label(key))
+    for key, spec in broadcast_entries()
+]
+
+
+def _numbered_choice(items, prompt):
+    """Retourne l'élément choisi dans une liste de tuples, ou None pour 0."""
+    for number, item in enumerate(items, 1):
+        print(f"  {number:>2}) {item[1]}")
+    print("  " + t("tx_back"))
+    raw = input("  " + prompt).strip()
+    if raw == "0":
+        return None
+    if not raw.isdigit() or not 1 <= int(raw) <= len(items):
+        print("  " + t("tx_invalid"))
+        return None
+    return items[int(raw) - 1]
+
+
+def _choose_transfer_network():
+    print("\n  " + t("transfer_choose_network"))
+    return _numbered_choice(_TRANSFER_NETWORKS, t("choice_prompt"))
+
+
+def _wallet_is_source_for(net: str, info: dict) -> bool:
+    """Vérifie l'actif ET la chaîne d'une entrée du coffre local."""
+    if info.get("asset_id"):
+        return info.get("asset_id") == net
+    # Compatibilité avec les coffres créés avant l'introduction du catalogue.
+    legacy_ids = {"eth": "eth_ethereum", "usdt": "usdt_ethereum",
+                  "usdc": "usdc_ethereum", "dai": "dai_ethereum"}
+    legacy_net = next((old for old, new in legacy_ids.items() if new == net), net)
+    token = str(info.get("token") or info.get("asset") or "").upper()
+    network = str(info.get("network") or "").lower()
+    if legacy_net in {"usdt", "usdc", "dai"}:
+        return token == legacy_net.upper() and network == "ethereum"
+    expected = {
+        "btc": "bitcoin", "eth": "ethereum", "sol": "solana",
+        "ltc": "litecoin", "doge": "dogecoin", "bnb": "bsc",
+        "polygon": "polygon", "avalanche": "avalanche",
+        "arbitrum": "arbitrum", "optimism": "optimism",
+    }
+    return not token and network == expected.get(legacy_net)
+
+
+def _choose_source_wallet(net: str, master_pw: str):
+    wm = load_wm()
+    wallets = wm.load_wallets(master_pw)
+    sources = [
+        (label, f"{pad_display(wallet_icon(info), 2)} {label}  —  {info.get('address', '?')}", info)
+        for label, info in sorted(wallets.items())
+        if isinstance(info, dict) and _wallet_is_source_for(net, info)
+    ]
+    if not sources:
+        print("  " + t("transfer_no_source"))
+        return None
+    print("\n  " + t("transfer_choose_source"))
+    selected = _numbered_choice(sources, t("choice_prompt"))
+    return selected[0] if selected else None
+
+
+def _beneficiary_wallet_to_network(wallet: dict):
+    """Convertit une adresse du carnet vers une clé du moteur de transfert."""
+    for net, _name in _TRANSFER_NETWORKS:
+        if _beneficiary_wallet_matches(net, wallet):
+            return net
+    return None
+
+
+def _choose_any_beneficiary_destination(master_pw: str):
+    """Choix bénéficiaire -> wallet enregistré -> réseau de transfert."""
+    benefs = _load_beneficiaries_for_transfer(master_pw)
+    if not benefs:
+        print("  " + t("transfer_no_beneficiary"))
+        return None
+
+    people = []
+    for label in sorted(benefs):
+        info = benefs.get(label) or {}
+        compatible = [
+            w for w in info.get("wallets", [])
+            if isinstance(w, dict) and _beneficiary_wallet_to_network(w)
+        ]
+        if compatible:
+            pseudo = str(info.get("pseudonyme", "")).strip()
+            shown = f"{label} ({pseudo})" if pseudo else label
+            people.append((label, f"{shown}  —  {len(compatible)} wallet(s)", compatible))
+
+    if not people:
+        print("  " + t("transfer_no_beneficiary"))
+        return None
+
+    print("\n  " + t("transfer_choose_beneficiary"))
+    person = _numbered_choice(people, t("choice_prompt"))
+    if person is None:
+        return None
+    beneficiary_label, _shown, wallets = person
+
+    choices = []
+    for wallet in wallets:
+        net = _beneficiary_wallet_to_network(wallet)
+        currency = str(wallet.get("devise", "")).upper()
+        network = str(wallet.get("reseau", ""))
+        platform = str(wallet.get("plateforme", "")).strip() or "Wallet"
+        address = str(wallet.get("adresse", "")).strip()
+        shown = (f"{icon_cell(currency)} {currency} / "
+                 f"{pad_display(network_icon(network), 2)} {network} / "
+                 f"{platform}  —  {address}")
+        choices.append((wallet, shown, net))
+
+    print("\n  " + t("transfer_choose_beneficiary_wallet"))
+    selected = _numbered_choice(choices, t("choice_prompt"))
+    if selected is None:
+        return None
+    wallet, _shown, net = selected
+    address = str(wallet.get("adresse", "")).strip()
+    spec = get_asset(net)
+    validation_net = (spec or {}).get("network") or _BENEFICIARY_VALIDATION_NET.get(net, net)
+    if not transfer.validate_address(validation_net, address):
+        print("  [!] Adresse enregistrée invalide pour ce réseau.")
+        return None
+    return net, address, beneficiary_label, wallet
+
+
+def menu_transfer(master_pw: str):
+    if not access.verify_secondary(master_pw):
+        return
+    while True:
+        print("\n" + t("transfer_title"))
+        print("─" * 50)
+        print("  " + pad_display(t("transfer_to_beneficiary"), PAD_OPT) + "📬")
+        print("  " + pad_display(t("transfer_to_external"), PAD_OPT) + "🌐")
+        print("  " + pad_display(t("tx_back"), PAD_OPT) + "↩️")
+        print("─" * 50)
+        choice = input(t("choice_prompt")).strip()
+        if choice == "1":
+            selected = _choose_any_beneficiary_destination(master_pw)
+            if selected:
+                net, address, beneficiary, wallet = selected
+                label = _choose_source_wallet(net, master_pw)
+                if label:
+                    _send_for(net, master_pw, label, address, beneficiary, wallet)
+        elif choice == "2":
+            selected_network = _choose_transfer_network()
+            if selected_network:
+                net = selected_network[0]
+                label = _choose_source_wallet(net, master_pw)
+                if label:
+                    address = input("  " + t("transfer_external_address")).strip()
+                    if address:
+                        _send_for(net, master_pw, label, address)
+        elif choice == "0":
+            return
+        else:
+            print("  " + t("tx_invalid"))
+
+
+def _send_for(net: str, master_pw: str, label: str, dest: str,
+              beneficiary_label=None, beneficiary_wallet=None):
+    """Envoi (transfert) générique pour une devise donnée.
+    Réutilise la fonction transfer_* appropriée de transfer.py."""
+    NAME = {
+        "btc": "BITCOIN", "eth": "ETHEREUM", "sol": "SOLANA", "ltc": "LITECOIN",
+        "doge": "DOGECOIN", "bnb": "BNB", "usdt": "TETHER", "usdc": "USD COIN",
+        "dai": "DAI", "polygon": "POLYGON", "avalanche": "AVALANCHE",
+        "arbitrum": "ARBITRUM", "optimism": "OPTIMISM", "xrp": "XRP",
+        "trx": "TRON", "atom": "COSMOS", "ada": "CARDANO", "xmr": "MONERO",
+    }
+    spec = get_asset(net)
+    title = spec["name"] if spec else NAME.get(net, net.upper())
+    tr = load_transfer()
+    if beneficiary_label:
+        platform = str((beneficiary_wallet or {}).get("plateforme", "")).strip()
+        network = str((beneficiary_wallet or {}).get("reseau", "")).strip()
+        print(f"  ✓ Bénéficiaire : {beneficiary_label}")
+        print(f"    Réseau       : {network or net}")
+        if platform:
+            print(f"    Plateforme   : {platform}")
+        print(f"    Adresse      : {dest}")
+    print("  " + t("send_amount_mode"))
+    mode = input("  " + t("send_mode_prompt")).strip().lower()
+    amount_raw = input("  " + t("send_amount_prompt")).strip()
+    try:
+        amount_val = float(amount_raw)
+    except ValueError:
+        print("  " + t("send_invalid")); return
+    if mode == "$" or mode == "usd":
+        prices = get_prices_usd()
+        if not prices:
+            print("  " + t("send_price_unavail")); return
+        rate_key = {"pol": "polygon"}.get(
+            (spec or {}).get("asset", net).lower(),
+            (spec or {}).get("asset", net).lower(),
+        )
+        rate = prices.get(rate_key) or prices.get(net)
+        if not rate:
+            print("  " + t("send_price_net_unavail", title=title)); return
+        amount_crypto = amount_val / rate
+        print(t("send_approx", amount=amount_crypto, net=net.upper(), rate=rate))
+    else:
+        amount_crypto = amount_val
+    confirm = input(t("send_confirm", amount=amount_crypto, net=net.upper(), dest=dest)).lower()
+    if confirm != "oui":
+        print("  " + t("cancelled")); return
+    tr.set_log_pass(master_pw)
+    # Le carnet d'adresses enrichit l'historique sans toucher à la transaction.
+    if hasattr(tr, "set_transaction_context"):
+        tr.set_transaction_context(
+            beneficiary=beneficiary_label,
+            platform=(beneficiary_wallet or {}).get("plateforme") if beneficiary_wallet else None,
+            beneficiary_network=(beneficiary_wallet or {}).get("reseau") if beneficiary_wallet else None,
+        )
+    legacy_net = {"eth_ethereum": "eth"}.get(net, net)
+    fn = {
+        "btc": tr.transfer_btc, "eth": tr.transfer_eth, "sol": tr.transfer_sol,
+        "ltc": tr.transfer_ltc, "doge": tr.transfer_doge, "bnb": tr.transfer_bnb,
+        "usdt": tr.transfer_usdt, "usdc": tr.transfer_usdc, "dai": tr.transfer_dai,
+        "polygon": tr.transfer_polygon, "avalanche": tr.transfer_avalanche,
+        "arbitrum": tr.transfer_arbitrum, "optimism": tr.transfer_optimism,
+        "xrp": tr.transfer_xrp, "trx": tr.transfer_trx, "atom": tr.transfer_atom,
+        "ada": tr.transfer_ada, "xmr": tr.transfer_xmr_from_seed,
+    }.get(legacy_net)
+    if spec and spec.get("kind") == "evm_token":
+        fn = lambda src, dst, qty, pw: tr.transfer_catalog_evm_token(
+            src, dst, qty, pw, net, spec
+        )
+    if fn is None:
+        print("  " + t("send_not_impl", title=title)); return
+    # Validation de l'adresse de destination AVANT toute signature/broadcast
+    # Map ticker (btc/eth/...) -> clé de règle (bitcoin/ethereum/...)
+    _NET_MAP = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana",
+                "ltc": "litecoin", "doge": "dogecoin", "bnb": "bsc",
+                "usdt": "ethereum", "usdc": "ethereum", "dai": "ethereum",
+                "polygon": "polygon", "avalanche": "avalanche",
+                "arbitrum": "arbitrum", "optimism": "optimism",
+                "xrp": "ripple", "trx": "tron", "atom": "cosmos", "ada": "cardano"}
+    _val_net = (spec or {}).get("network") or _NET_MAP.get(net, net)
+    if not transfer.validate_address(_val_net, dest):
+        print("  " + t("send_addr_invalid", net=title, dest=dest[:20]))
+        return
+    fn(label, dest, amount_crypto, master_pw)
+
+
+def _send_xmr_from_seed():
+    """Transfert Monero en mode non-custodial : l'utilisateur saisit son
+    mnémonique (export papier), le seed est restauré temporairement dans la
+    passerelle, la tx signée + diffusée, puis supprimée. Aucun wallets.enc
+    n'est nécessaire (le client peut tourner sans fichier de wallet)."""
+    tr = load_transfer()
+    print("\n🔑 " + t("xmr_seed_title"))
+    print("  " + t("xmr_seed_warn"))
+    mnemonic = get_secret("  " + t("xmr_seed_prompt"))
+    if not mnemonic or len(mnemonic.strip().split()) < 20:
+        print("  " + t("xmr_seed_invalid")); return
+    label = input("  " + t("xmr_seed_label")).strip() or "XMR"
+    dest = input("  " + t("xmr_dest_prompt")).strip()
+    amount_raw = input("  " + t("xmr_amount_prompt")).strip()
+    try:
+        amount = float(amount_raw)
+    except ValueError:
+        print("  " + t("send_invalid")); return
+    confirm = input(t("send_confirm", amount=amount, net="XMR", dest=dest)).lower()
+    if confirm != "oui":
+        print("  " + t("cancelled")); return
+    tr.set_log_pass("")
+    tr.transfer_xmr_from_seed(mnemonic.strip(), dest, amount, label)
+
+
+def menu_exchange(master_pw: str):
+    """Convertisseur crypto <-> crypto à cours en direct (CoinGecko).
+    Outil lecture seule : calcule la valeur équivalente d'un montant donné
+    dans toutes les devises disponibles. N'effectue AUCUN échange on-chain
+    (ceci est un portefeuille froid non-dépositaire)."""
+    prices = get_prices_usd()
+    if not prices:
+        print("  " + t("exchange_price_unavail")); return
+    wm = load_wm()
+    wallets = wm.load_wallets(master_pw)
+    if not wallets:
+        print("  Aucun portefeuille disponible pour la conversion."); return
+    print("\n  Quel wallet souhaitez-vous convertir ?")
+    entries = list(wallets.items())
+    for idx, (label, info) in enumerate(entries, 1):
+        print(f"  {idx}) {label} — {network_icon(info.get('network') or info.get('reseau'))} "
+              f"{info.get('network') or info.get('reseau') or '?'}")
+    raw = input("  Votre choix : ").strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= len(entries):
+        print("  Choix invalide."); return
+    source_label, source_info = entries[int(raw) - 1]
+    # Devises disponibles (clé de prix -> libellé affiché)
+    cur = {
+        "btc": "BTC", "eth": "ETH", "sol": "SOL", "ltc": "LTC",
+        "doge": "DOGE", "bnb": "BNB", "usdt": "USDT", "usdc": "USDC",
+        "dai": "DAI", "polygon": "MATIC", "avalanche": "AVAX",
+        "arbitrum": "ARB", "optimism": "OP", "xrp": "XRP",
+        "trx": "TRX", "atom": "ATOM", "ada": "ADA",
+    }
+    print("\n" + t("exchange_title"))
+    print("─" * 50)
+    print("  " + t("exchange_devises") + " ".join(f"{sym(t)}{v}" for t, v in cur.items()))
+    src = input("  " + t("exchange_src_prompt")).strip().lower()
+    if src not in cur:
+        print("  " + t("exchange_src_unknown")); return
+    compatible = [(l, i) for l, i in entries if l != source_label
+                  and (i.get('network') or i.get('reseau'))]
+    if not compatible:
+        print("  Aucun wallet de destination compatible."); return
+    print("\n  Vers quel wallet doit recevoir la crypto ?")
+    for idx, (label, info) in enumerate(compatible, 1):
+        print(f"  {idx}) {label} — {network_icon(info.get('network') or info.get('reseau'))} "
+              f"{info.get('network') or info.get('reseau') or '?'}")
+    dest_raw = input("  Votre choix : ").strip()
+    if not dest_raw.isdigit() or not 1 <= int(dest_raw) <= len(compatible):
+        print("  Choix invalide."); return
+    dest_label, dest_info = compatible[int(dest_raw) - 1]
+    print("\n  Montant à convertir :")
+    print("  1) Crypto")
+    print("  2) $")
+    unit = input("  Votre choix : ").strip()
+    amount_raw = input("  Montant : ").strip()
+    try:
+        amount = float(amount_raw)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        print("  " + t("exchange_invalid")); return
+    usd_value = amount * prices[src] if unit == "1" else amount
+    if unit == "2":
+        amount = usd_value / prices[src]
+    elif unit != "1":
+        print("  Choix invalide."); return
+    print(t("exchange_result", amount=amount, cur=cur[src], usd=usd_value))
+    dest_code = next((k for k, v in cur.items() if v == str(dest_info.get('asset', '')).upper()), None)
+    if dest_code and prices.get(dest_code):
+        print(f"  Destination : {dest_label} → {usd_value / prices[dest_code]:.8f} {cur[dest_code]}")
+    print("─" * 50)
+    print("  " + t("exchange_equiv"))
+    for code, name in cur.items():
+        if code == src:
+            continue
+        rate = prices[code]
+        if not rate:
+            continue
+        equiv = usd_value / rate
+        print(f"    {sym(code)}{name:<7} {equiv:.8f}")
+    print("─" * 50)
+    print("  " + t("exchange_note"))
+
+    # Propose le guide de conversion vers XMR (sans API / sans compte)
+    print("─" * 50)
+    want_xmr = input(t("exchange_to_xmr_prompt")).strip().lower()
+    if want_xmr in ("o", "oui", "y", "yes"):
+        xmr_addr = input(t("exchange_xmr_addr_prompt")).strip()
+        if not transfer.validate_address("monero", xmr_addr):
+            print("  " + t("send_addr_invalid", net="MONERO", dest=xmr_addr[:20]))
+            return
+        import swap_guided
+        swap_guided.print_guide(src, amount, xmr_addr)
+
+
+def menu_decrypt(master_pw: str):
+    level = access.get_access_level()
+    if level in {"medium", "advanced"} and not access.verify_secondary(master_pw):
+        return
+    if level == "medium":
+        print("  ✅ Mot de passe secondaire accepté : accès identique au mode Easy.")
+    elif level == "advanced":
+        print("  ✅ Accès avancé : chaque portefeuille demandera sa passphrase pour révéler ses secrets.")
+    while True:
+        print("\n" + "─" * 50)
+        print("  " + t("decrypt_title"))
+        print("─" * 50)
+        _dec_opts = [
+            ("decrypt_1", "📦"),   # tous les wallets
+            ("decrypt_2", "🏷️"),   # label spécifique
+            ("decrypt_0", "↩️"),   # retour
+        ]
+        for _k, _ic in _dec_opts:
+            print("  " + pad_display(t(_k), PAD_OPT) + _ic)
+        print("─" * 50)
+        sous = input(t("choice_prompt")).strip()
+        if sous == "1":
+            _menu_decrypt_all(master_pw)
+        elif sous == "2":
+            _menu_decrypt_one(master_pw)
+        elif sous == "0":
+            break
+        else:
+            print("  " + t("decrypt_invalid"))
+
+
+def _menu_decrypt_one(master_pw: str):
+    wm = load_wm()
+    passphrase = master_pw
+    wallets = wm.load_wallets(passphrase)
+    if not wallets:
+        print("  " + t("decrypt_no_wallet")); return
+    print("  " + t("decrypt_available"))
+    for label, info in wallets.items():
+        print(f"    - {pad_display(wallet_icon(info), 2)} {label}  "
+              f"({network_icon(info.get('network'))} {info.get('network','?')})")
+    label = input("  " + t("decrypt_label_prompt")).strip()
+    if label not in wallets:
+        print("  " + t("not_found")); return
+    info = wallets[label]
+    print("\n" + t("decrypt_header", label=label, net=info.get('network','?').upper()))
+    print("=" * 50)
+    print("  ⚠️  Les clés privées/mnémoniques révélées restent VISIBLES à l'écran.")
+    print("     Ne les affichez jamais en public / ne les photographiez pas.")
+    reveal = input("  " + t("decrypt_reveal")).lower() == "oui"
+    SENS = {"private_key_wif", "mnemonic", "private_key_hex",
+            "private_key_base58", "private_key_bytes_hex"}
+    if info.get("protected_secrets"):
+        if reveal:
+            phrase = access.ask_wallet_credential(info, "revealing wallet keys")
+            if not phrase:
+                return
+            info = dict(info)
+            info.update(access.unlock_wallet_secrets(info, phrase))
+            del phrase
+        else:
+            info = dict(info)
+            info["protected_secrets"] = t("decrypt_masked")
+            info["word_challenge"] = t("decrypt_masked")
+    elif reveal and access.get_access_level() != "easy" and any(k in info for k in SENS):
+        print("  ! Ce portefeuille ancien contient encore des secrets non compartimentés.")
+        print("    Réimportez-le ou migrez-le avant toute révélation en mode Medium/Advanced.")
+        reveal = False
+    for k, v in info.items():
+        if k in SENS and not reveal:
+            v = t("decrypt_masked")
+        print(f"   {k:.<30} {v}")
+
+
+def _menu_decrypt_all(master_pw: str):
+    wm = load_wm()
+    passphrase = master_pw
+    wallets = wm.load_wallets(passphrase)
+    if not wallets:
+        print("  " + t("decrypt_no_wallet")); return
+    print("  ⚠️  Les clés privées/mnémoniques révélées restent VISIBLES à l'écran.")
+    print("     Ne les affichez jamais en public / ne les photographiez pas.")
+    reveal = input("  " + t("decrypt_reveal")).lower() == "oui"
+    SENS = {"private_key_wif", "mnemonic", "private_key_hex",
+            "private_key_base58", "private_key_bytes_hex"}
+    for label, info in wallets.items():
+        print("\n" + t("decrypt_header", label=label, net=info.get('network','?').upper()))
+        print("-" * 50)
+        if info.get("protected_secrets"):
+            if reveal:
+                phrase = access.ask_wallet_credential(
+                    info, f"revealing the keys of {label}"
+                )
+                if not phrase:
+                    continue
+                info = dict(info)
+                info.update(access.unlock_wallet_secrets(info, phrase))
+                del phrase
+            else:
+                info = dict(info)
+                info["protected_secrets"] = t("decrypt_masked")
+                info["word_challenge"] = t("decrypt_masked")
+        elif reveal and access.get_access_level() != "easy" and any(k in info for k in SENS):
+            print("  ! Secrets non compartimentés : révélation bloquée en mode sécurisé.")
+            reveal = False
+        for k, v in info.items():
+            if k in SENS and not reveal:
+                v = t("decrypt_masked")
+            print(f"   {k:.<30} {v}")
+
+
+def _read_history_lines(master_pw: str):
+    """Renvoie la liste (déchiffrée) des lignes d'historique.
+    Priorité au journal chiffré transactions.log.enc, sinon le clair."""
+    hist_dir = BASE / "historique"
+    enc = hist_dir / "transactions.log.enc"
+    plain = hist_dir / "transactions.log"
+    if enc.exists():
+        try:
+            import transfer as _tr
+        except Exception:
+            _tr = load_transfer()
+        _tr.set_log_pass(master_pw)
+        lines = []
+        for raw in enc.read_bytes().split(b"\n"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                lines.append(_tr._log_decrypt(raw))
+            except Exception:
+                pass
+        if lines:
+            return lines
+    return []
+
+
+def _write_history_lines(lines, master_pw: str):
+    """Réécrit le journal chiffré transactions.log.enc à partir d'une
+    liste de lignes en clair. Supprime l'ancien journal en clair."""
+    import transfer as _tr
+    _tr.set_log_pass(master_pw)
+    hist_dir = BASE / "historique"
+    hist_dir.mkdir(parents=True, exist_ok=True)
+    enc = hist_dir / "transactions.log.enc"
+    plain = hist_dir / "transactions.log"
+    blob = b""
+    for l in lines:
+        if not l.strip():
+            continue
+        blob += _tr._log_encrypt(l if l.endswith("\n") else l + "\n") + b"\n"
+    enc.write_bytes(blob)
+    if plain.exists():
+        plain.unlink()
+
+
+def _label_of(line: str):
+    """Extrait SOURCE/WALLET, y compris les labels JSON contenant des espaces."""
+    import re
+    import json as _json
+    for key in ("SOURCE", "WALLET"):
+        m = re.search(key + r'=("(?:\\.|[^"\\])*"|[^\s]+)', line)
+        if m:
+            raw = m.group(1)
+            try:
+                return _json.loads(raw) if raw.startswith('"') else raw
+            except Exception:
+                return raw.strip('"')
+    return None
+
+
+def _net_of(line: str):
+    """Extrait le ticker (minuscules) d'une ligne d'historique :
+    'RESEAU=BTC ...' ou 'REÇU BTC ...' -> 'btc'."""
+    import re
+    m = re.search(r"RESEAU=([^\s]+)", line)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"REÇU\s+([^\s]+)", line)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def _fmt_hist_line(line: str):
+    """Préfixe une ligne d'historique par l'icône Unicode de sa devise
+    (cohérent avec les menus Création/Transfert/Convertisseur)."""
+    net = _net_of(line)
+    if net:
+        return f"{sym(net)} {line}"
+    return f"🪙 {line}"
+
+
+def menu_show_history(master_pw: str):
+    """Sous-menu Historique (enfant du menu principal, ex-option 4).
+    Propose : par label, tous les historiques, suppression par label,
+    et suppression totale."""
+    if not access.verify_secondary(master_pw):
+        return
+    while True:
+        print("\n" + t("hist_title"))
+        print("─" * 50)
+        _hist_opts = [
+            ("hist_1", "🔖"),   # historique par label
+            ("hist_2", "📋"),   # tous les historiques
+            ("hist_3", "🗑️"),   # supprimer un historique
+            ("hist_4", "🧹"),   # supprimer tous les historiques
+            ("hist_0", "↩️"),   # retour
+        ]
+        for _k, _ic in _hist_opts:
+            print("  " + pad_display(t(_k), PAD_OPT) + _ic)
+        choix = input(t("choice_prompt")).strip()
+        if choix == "1":
+            _history_by_label(master_pw)
+        elif choix == "2":
+            _history_all(master_pw)
+        elif choix == "3":
+            _history_delete_by_label(master_pw)
+        elif choix == "4":
+            _history_delete_all(master_pw)
+        elif choix == "0":
+            return
+        else:
+            print("  " + t("hist_invalid"))
+
+
+def _history_all(master_pw: str):
+    lines = _read_history_lines(master_pw)
+    print("\n" + t("hist_all_title"))
+    print("─" * 60)
+    if not lines:
+        print("  " + t("hist_none"))
+        return
+    for l in lines:
+        print(f"  {_fmt_hist_line(l)}")
+    print("─" * 60)
+    print(t("hist_count", n=len(lines)))
+
+
+def _history_by_label(master_pw: str):
+    label = input("  Label : ").strip()
+    lines = _read_history_lines(master_pw)
+    matched = [l for l in lines if _label_of(l) == label]
+    print("\n" + t("hist_by_label_title", label=label))
+    print("─" * 60)
+    if not matched:
+        print("  " + t("hist_none_label"))
+        return
+    for l in matched:
+        print(f"  {_fmt_hist_line(l)}")
+    print("─" * 60)
+    print(t("hist_by_label_count", n=len(matched), label=label))
+
+
+def _history_delete_by_label(master_pw: str):
+    if not _history_require_masterkey(master_pw):
+        return
+    label = input("  " + t("hist_del_label_prompt")).strip()
+    lines = _read_history_lines(master_pw)
+    if not lines:
+        print("  " + t("hist_del_none"))
+        return
+    kept = [l for l in lines if _label_of(l) != label]
+    removed = len(lines) - len(kept)
+    if removed == 0:
+        print(t("hist_no_label", label=label))
+        return
+    confirm = input(t("hist_del_confirm", n=removed, label=label)).lower()
+    if confirm != "oui":
+        print("  " + t("cancelled")); return
+    _write_history_lines(kept, master_pw)
+    print(t("hist_del_done", n=removed, label=label))
+
+
+def _history_delete_all(master_pw: str):
+    if not _history_require_masterkey(master_pw):
+        return
+    lines = _read_history_lines(master_pw)
+    if not lines:
+        print("  " + t("hist_del_none"))
+        return
+    confirm = input(t("hist_del_all_confirm", n=len(lines))).lower()
+    if confirm != "oui":
+        print("  " + t("cancelled")); return
+    _write_history_lines([], master_pw)
+    print("  " + t("hist_del_all_done"))
+
+
+def _history_require_masterkey(master_pw: str) -> bool:
+    """Ré-authentifie toute suppression d'historique.
+
+    Le secret saisi n'est ni affiché, ni journalisé, ni conservé. La
+    comparaison à temps constant limite les fuites liées au temps de réponse.
+    """
+    import hmac
+    print("\n  🔐 " + t("master_enter"))
+    entered = get_secret("  ! " + t("master_prompt"))
+    authenticated = hmac.compare_digest(
+        entered.encode("utf-8"), master_pw.encode("utf-8")
+    )
+    # Réduit la durée de vie de la référence locale autant que Python le permet.
+    del entered
+    if not authenticated:
+        print("  " + t("master_incorrect"))
+        return False
+    return True
+
+
+def menu_scan_received(master_pw: str):
+    """Scanne les réceptions SOL entrantes et les affiche + journalise."""
+    tr = load_transfer()
+    wm = load_wm()
+    wallets = wm.load_wallets(master_pw)
+    if not wallets:
+        print("  " + t("no_wallet")); return
+    sol_wallets = {l: i for l, i in wallets.items()
+                   if i.get("network", "").lower() == "solana"}
+    if not sol_wallets:
+        print("  " + t("scan_no_sol")); return
+    print("\n" + t("scan_title"))
+    print("─" * 60)
+    print("  " + t("scan_available"))
+    for label in sol_wallets:
+        print(f"    - {label}")
+    label = input("  " + t("scan_label_prompt")).strip()
+    if label not in sol_wallets:
+        print("  " + t("not_found")); return
+
+    print(t("scan_api"))
+    try:
+        received = tr.scan_sol_received(label, master_pw)
+    except Exception as e:
+        print(t("scan_error", e=e), file=sys.stderr)
+        return
+
+    if not received:
+        print("  " + t("scan_none"))
+        return
+
+    tr.set_log_pass(master_pw)
+    print(t("scan_found", n=len(received)))
+    print(t("scan_table_hdr"))
+    print("  " + "─" * 78)
+    for r in received:
+        sender = r["sender"][:10] + "…" if len(r["sender"]) > 11 else r["sender"]
+        receiver = (r["receiver"][:10] + "…"
+                    if len(r["receiver"]) > 11 else r["receiver"])
+        print(f"  {r['datetime']:<21} {sender:<14} {receiver:<14} "
+              f"{r['amount_sol']:.9f} {r['signature'][:12]}…")
+        print(f"     ↳ TxID complet : {r['signature']}")
+        print(f"     ↳ https://explorer.solana.com/tx/{r['signature']}")
+        tr.log_received("sol", label, r["sender"], r["receiver"],
+                        r["amount_sol"], r["signature"], r["datetime"], r["url"])
+    print("\n  " + t("scan_done"))
+
+
+def _balance_key_for(info: dict):
+    """Renvoie (clé_de_lecture, symbole) pour _read_balance selon le wallet.
+    Gère les tokens ERC-20 (USDT/USDC/DAI) et les réseaux natifs."""
+    net = info.get("network", "?")
+    tok = (info.get("token") or "").lower()
+    table = {
+        "bitcoin": ("btc", "BTC"), "ethereum": ("eth", "ETH"),
+        "solana": ("sol", "SOL"), "litecoin": ("ltc", "LTC"),
+        "dogecoin": ("doge", "DOGE"), "bsc": ("bnb", "BNB"),
+        "polygon": ("polygon", "MATIC"), "avalanche": ("avalanche", "AVAX"),
+        "arbitrum": ("arbitrum", "ARB"), "optimism": ("optimism", "OP"),
+        "ripple": ("xrp", "XRP"), "tron": ("trx", "TRX"),
+        "cosmos": ("atom", "ATOM"), "cardano": ("ada", "ADA"),
+        "monero": ("xmr", "XMR"),
+    }
+    if net == "ethereum" and tok in ("usdt", "usdc", "dai"):
+        return tok, tok.upper()
+    return table.get(net, (None, "?"))
+
+
+def menu_delete(master_pw: str):
+    if access.get_access_level() in {"medium", "advanced"} and not access.verify_secondary(master_pw):
+        return
+    wm = load_wm()
+    passphrase = master_pw
+    wallets = wm.load_wallets(passphrase)
+    if not wallets:
+        print("  " + t("delete_no_wallet")); return
+    print("  " + t("delete_available"))
+    for label, info in wallets.items():
+        print(f"    - {pad_display(wallet_icon(info), 2)} {label}  "
+              f"({network_icon(info.get('network'))} {info.get('network', '?')})")
+    label = input("  " + t("delete_label_prompt")).strip()
+    if label not in wallets:
+        print("  " + t("not_found")); return
+    info = wallets[label]
+    addr = info.get("address", "?")
+    print(t("delete_target", label=label, net=info.get('network', '?').upper()))
+    print(t("delete_addr", addr=addr))
+
+    # ── Garde-fou : vérification du solde avant suppression ──
+    read_key, sym = _balance_key_for(info)
+    bal = _read_balance(read_key, addr) if read_key else None
+    if bal is None:
+        # Réseau non géré (ex: Monero) : solde non vérifiable.
+        # On demande une confirmation explicite (saisie du label) plutôt
+        # que de refuser systématiquement, comme pour le cas bal > 0.
+        print("  " + t("delete_bal_unavail"))
+        override = input("  " + t("delete_confirm_prompt")).strip()
+        if override != label:
+            print("  " + t("delete_cancelled")); return
+        print("  " + t("delete_confirmed"))
+    elif bal > 0:
+        print(t("delete_warning", bal=bal, sym=sym))
+        print("  " + t("delete_warning2"))
+        override = input("  " + t("delete_confirm_prompt")).strip()
+        if override != label:
+            print("  " + t("delete_cancelled")); return
+        print("  " + t("delete_confirmed"))
+    else:
+        confirm = input("  " + t("delete_confirm_prompt")).lower()
+        if confirm != label:
+            print("  " + t("delete_cancelled")); return
+
+    del wallets[label]
+    wm.save_wallets(wallets, passphrase)
+    print(t("delete_done", label=label))
+
+
+def unlock_master():
+    """Déverrouille le coffre. Sans la passphrase, aucune donnée sensible n'est lisible."""
+    wm = load_wm()
+    WALLET_FILE = BASE / "wallets" / "wallets.enc"
+    if not WALLET_FILE.exists():
+        level = access.choose_access_level()
+        sec.set_security_mode({"easy": "standard", "medium": "reinforced",
+                               "advanced": "maximum"}[level])
+        access.set_access_level(level)
+        pw = access.ask_password("Masterkey")
+        wm.save_wallets({}, pw)
+        if level in {"medium", "advanced"}:
+            access.configure_secondary(pw)
+        _migrate_sensitive_data(pw)
+        print("  ✅ Coffre initialisé : Argon2id + AES-256-GCM.")
+        return pw
+
+    while True:
+        pw = get_secret("! 🔑 " + _st("enter"))
+        raw = WALLET_FILE.read_bytes()
+        data = wm.decrypt_data(raw, pw)
+        if data is not None:
+            # Migration transparente d'un ancien wallets.enc Fernet vers KCW2.
+            if not sec.is_secure_blob(raw):
+                if not sec.CONFIG_FILE.exists():
+                    sec.set_security_mode("reinforced")
+                wm.save_wallets(data, pw)
+            _migrate_sensitive_data(pw)
+            return pw
+        print("  [!] " + t("master_incorrect"))
+
+def _migrate_sensitive_data(pw: str):
+    """Migre les anciens fichiers sensibles vers le coffre chiffré v2."""
+    try:
+        import beneficiaries_manager as _bm
+        plain = BASE / "beneficiaries.json"
+        if plain.exists():
+            _bm.migrate_plaintext(pw, plain)
+        elif _bm.BENEFICIARIES_FILE.exists():
+            raw = _bm.BENEFICIARIES_FILE.read_bytes()
+            if not sec.is_secure_blob(raw):
+                data = _bm.load_beneficiaries(pw)
+                _bm.save_beneficiaries(data, pw)
+    except Exception as e:
+        print(f"  [!] Migration bénéficiaires impossible : {e}")
+    _migrate_plain_history(pw)
+
+
+def _migrate_plain_history(pw):
+    """Si un transactions.log clair existe, le chiffre et supprime le clair."""
+    try:
+        import transfer as _tr  # accès au chiffrement du journal
+    except Exception:
+        _tr = load_transfer()
+    plain = BASE / "historique" / "transactions.log"
+    if not plain.exists():
+        return
+    lines = [l.rstrip("\n") for l in plain.read_text(encoding="utf-8").splitlines()
+             if l.strip() and not l.strip().startswith("#")]
+    if not lines:
+        plain.unlink()
+        return
+    _tr.set_log_pass(pw)
+    enc = BASE / "historique" / "transactions.log.enc"
+    with open(enc, "wb") as fh:
+        for l in lines:
+            fh.write(_tr._log_encrypt(l + "\n") + b"\n")
+    os.chmod(enc, 0o600)
+    plain.unlink()
+    print("  " + t("journal_migrated"))
+
+
+def _tor_indicator(on: bool) -> str:
+    """Voyant lumineux : vert vif si actif, rouge vif si inactif (couleurs
+    ANSI seulement sur un vrai terminal, sinon texte brut)."""
+    if on:
+        label = t("tor_on")
+        return "\033[92m●\033[0m " + t("tor_state") + " " + ("\033[92m" + label + "\033[0m"
+                if sys.stdout.isatty() else label)
+    label = t("tor_off")
+    return "\033[91m●\033[0m " + t("tor_state") + " " + ("\033[91m" + label + "\033[0m"
+            if sys.stdout.isatty() else label)
+
+
+def tor_start():
+    """Lance le démon Tor et route tout le trafic réseau du process via son
+    SOCKS5 (DNS résolu par Tor, rdns=True, pour ne rien fuiter)."""
+    global TOR_PROC, _TOR_ORIG_SOCKET, NET_KILLED
+    if TOR_PROC is not None:
+        print("  " + t("tor_already")); return True
+    # La fonction 1 ALLUME tout : même depuis un état « réseau coupé »,
+    # on doit d'abord lever le leurre de socket pour permettre le bootstrap.
+    if NET_KILLED:
+        _net_restore()
+    TOR_DATA.mkdir(parents=True, exist_ok=True)
+    # nettoie un éventuel verrou laissé par un démarrage avorté
+    lock = TOR_DATA / "lock"
+    if lock.exists():
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+    try:
+        proc = subprocess.Popen(
+            ["tor", "--SocksPort", str(TOR_PORT),
+             "--DataDirectory", str(TOR_DATA),
+             "--CookieAuthentication", "0",
+             "--Log", "notice stdout"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        print("  " + t("tor_binary_missing"))
+        return False
+
+    # Attendre que le SocksPort écoute (Tor bootstrap peut prendre ~10-30 s)
+    for _ in range(40):
+        try:
+            with socket.create_connection(("127.0.0.1", TOR_PORT), timeout=1):
+                break
+        except OSError:
+            if proc.poll() is not None:
+                print(t("tor_stopped", code=proc.returncode))
+                return False
+            time.sleep(1)
+    else:
+        proc.terminate()
+        print("  " + t("tor_no_start"))
+        return False
+
+    try:
+        import socks
+    except ImportError:
+        proc.terminate()
+        print("  " + t("tor_pysocks_missing"))
+        return False
+
+    if _TOR_ORIG_SOCKET is None:
+        _TOR_ORIG_SOCKET = socket.socket
+    socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", TOR_PORT, rdns=True)
+    socket.socket = socks.socksocket
+    TOR_PROC = proc
+    # Activer la fonction 1 ALLUME tout : Tor + Web + réseau global
+    WEB_ENABLED = True
+    NET_KILLED = False
+    print("  " + t("tor_active"))
+    return True
+
+
+def tor_stop():
+    """Arrête le démon Tor et restaure le socket réseau direct."""
+    global TOR_PROC, _TOR_ORIG_SOCKET
+    if TOR_PROC is not None:
+        TOR_PROC.terminate()
+        try:
+            TOR_PROC.wait(timeout=5)
+        except Exception:
+            TOR_PROC.kill()
+        TOR_PROC = None
+    if _TOR_ORIG_SOCKET is not None:
+        socket.socket = _TOR_ORIG_SOCKET
+        _TOR_ORIG_SOCKET = None
+    print("  " + t("tor_disabled"))
+
+
+def _net_yesno(on: bool) -> str:
+    """Voyant OUI (point vert) / NON (bouton rouge), couleurs ANSI si TTY."""
+    if on:
+        label = t("net_yes")
+        return "● " + ("" + label + ""
+                if sys.stdout.isatty() else label)
+    label = t("net_no")
+    return "● " + ("" + label + ""
+            if sys.stdout.isatty() else label)
+
+
+def _net_cut(on: bool) -> str:
+    """État de la coupure globale : ACTIVÉ (vert) / COUPÉ (rouge)."""
+    if on:
+        label = t("net_3_off")   # réseau coupé
+        return "● " + ("" + label + ""
+                if sys.stdout.isatty() else label)
+    label = t("net_3_on")        # réseau actif
+    return "● " + ("" + label + ""
+            if sys.stdout.isatty() else label)
+
+
+def _net_cut_all():
+    """Coupe tout le réseau du dossier Crypto Wallet.
+
+    - Tor : arrête le démon et restaure le socket direct.
+    - Web : désactive le flag WEB_ENABLED (aucune requête ne sortira).
+    - Sockets : on patche socket.socket sur un leurre qui lève OSError,
+      ce qui rend toute connexion sortante impossible pour le process.
+    """
+    global NET_KILLED, WEB_ENABLED, TOR_PROC, _TOR_ORIG_SOCKET
+    tor_stop()
+    WEB_ENABLED = False
+    NET_KILLED = True
+    # Leurre : toute tentative d'ouverture de socket échoue immédiatement
+    def _blocked(*a, **k):
+        raise OSError("Network disabled for the whole Crypto Wallet folder")
+    socket.socket = _blocked
+
+
+def _net_restore():
+    """Restaure entièrement le réseau (inverse de _net_cut_all) :
+
+    - NET_KILLED passe à False.
+    - WEB_ENABLED repasse à True.
+    - socket.socket est remis sur le socket natif (on lève le leurre).
+    Ne touche PAS à Tor (qui se gère séparément via les fonctions 1/2).
+    """
+    global NET_KILLED, WEB_ENABLED
+    NET_KILLED = False
+    WEB_ENABLED = True
+    socket.socket = NATIVE_SOCKET
+
+
+def menu_reseau(master_pw: str):
+    """Sous-menu Réseau (option 8) :
+    1) Réseau Tor (oui/non)  → démarre/arrête le routage Tor
+    2) Réseau Web (oui/non)  → active/coupe les requêtes Web directes
+    3) Couper le réseau      → coupe TOUT le réseau du dossier (vert↔rouge)."""
+    global WEB_ENABLED, NET_KILLED
+    while True:
+        tor_on = TOR_PROC is not None
+        print("\n" + "─" * 50)
+        print("  " + t("net_title"))
+        print("─" * 50)
+        print("  " + t("net_1") + " " + _net_yesno(tor_on))
+        print("  " + t("net_2") + " " + _net_yesno(WEB_ENABLED))
+        print("  " + t("net_state") + _net_cut(NET_KILLED))
+        print("─" * 50)
+        print("  " + t("net_1"))
+        print("  " + t("net_2"))
+        print("  " + t("net_3"))
+        print("  " + t("tor_0"))
+        print("─" * 50)
+        c = input(t("choice_prompt")).strip()
+        if c == "1":
+            if tor_on:
+                tor_stop()
+            else:
+                tor_start()
+        elif c == "2":
+            WEB_ENABLED = not WEB_ENABLED
+            if not WEB_ENABLED:
+                # Désactiver le réseau Web coupe OBLIGATOIREMENT le réseau Tor
+                tor_stop()
+            else:
+                # Réactiver le réseau Web lève automatiquement la coupure globale
+                if NET_KILLED:
+                    _net_restore()
+        elif c == "3":
+            # Toggle unique : un seul clic coupe OU rétablit tout le réseau
+            if NET_KILLED:
+                _net_restore()
+                print("  " + t("net_3_restore"))
+            else:
+                _net_cut_all()
+                print("  " + t("net_3_done"))
+        elif c == "0":
+            break
+        else:
+            print("  " + t("net_invalid"))
+
+
+
+def _beta_confirmed(value: str) -> bool:
+    """Accepte les réponses positives usuelles dans toutes les langues UI."""
+    normalized = value.strip().lower()
+    yes_values = {
+        "oui", "o", "yes", "y", "sí", "si", "s", "да", "д",
+        "是", "好", "نعم", "ن", "כן", "כ",
+    }
+    return normalized in yes_values
+
+
+def menu_beta():
+    """Rubrique de contact Beta. Aucun contenu du wallet n'est joint."""
+    print("\n" + "=" * 50)
+    print("  " + t("beta_title"))
+    print("=" * 50)
+    print("  " + t("beta_intro1"))
+    print("  " + t("beta_intro2"))
+    print("  " + t("beta_intro3"))
+    print("  " + t("beta_warning") + "\n")
+
+    name = input("  " + t("beta_name")).strip()
+    reply_to = input("  " + t("beta_email")).strip()
+    print("  " + t("beta_message"))
+    lines = []
+    while True:
+        line = input("  > ")
+        if line.strip() == ".":
+            break
+        lines.append(line)
+    message = "\n".join(lines).strip()
+    if not message:
+        print("  " + t("beta_empty"))
+        return
+
+    print("\n  " + t("beta_summary"))
+    print(f"  {t('beta_name_show')} : {name or t('beta_not_set')}")
+    print(f"  {t('beta_email_show')} : {reply_to or t('beta_not_set')}")
+    print("  " + t("beta_message_show"))
+    for line in message.splitlines():
+        print("    " + line)
+    confirm = input("\n  " + t("beta_confirm"))
+    if not _beta_confirmed(confirm):
+        print("  " + t("beta_cancel"))
+        return
+
+    try:
+        from beta_feedback import send_beta_message
+        send_beta_message(name, reply_to, message)
+        print("  " + t("beta_sent"))
+    except Exception as exc:
+        print("  " + t("beta_failed", error=exc))
+        print("  " + t("beta_config"))
+
+
+def menu_about():
+    """Informations sur le projet, traduites selon la langue courante."""
+    print("\n" + "=" * 50)
+    print("  " + t("about_title"))
+    print("=" * 50)
+    print("  " + t("about_line1"))
+    print("  " + t("about_line2"))
+    print("  " + t("about_line3"))
+    print("  " + t("about_line4"))
+    input("\n  " + t("about_back"))
+
+
+def menu_debug(master_pw: str):
+    """Diagnostics locales et génération d'un rapport transmissible manuellement."""
+    import datetime
+    import secrets
+    while True:
+        print("\n  DEBUG / RAPPORT")
+        print("  1) Vérifier les fichiers chiffrés")
+        print("  2) Générer un rapport")
+        print("  0) Retour")
+        choice = input("  Choix : ").strip()
+        if choice == "1":
+            for path in (BASE / "wallets" / "wallets.enc", BASE / "beneficiaries.enc",
+                         BASE / "historique" / "transactions.log.enc"):
+                state = "présent" if path.exists() else "absent (normal si inutilisé)"
+                print(f"  {path.name}: {state}")
+            input("  Entrée pour continuer...")
+        elif choice == "2":
+            report_id = secrets.token_hex(6).upper()
+            subject = f"Crypto Cold Wallet - Report {report_id}"
+            body = (f"Report ID: {report_id}\n"
+                    f"Date: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n"
+                    "Describe the issue here. Do not include passwords, seeds or private keys.\n")
+            print("\n  Rapport généré.")
+            print(f"  ID : {report_id}")
+            print(f"  Objet à utiliser : {subject}")
+            print("  Copiez ce texte et envoyez-le manuellement à votre adresse de support.")
+            print("\n" + body)
+            input("  Entrée pour continuer...")
+        elif choice == "0":
+            return
+        else:
+            print("  Choix invalide.")
+
+
+def menu_update():
+    """Rubrique réservée au futur mécanisme de déploiement."""
+    print("\n  MISE À JOUR")
+    print("  Le système de déploiement public n'est pas encore configuré.")
+    print("  Vos données restent inchangées et aucun fichier n'est déplacé.")
+    input("  Appuyez sur Entrée pour revenir au menu principal...")
+
+def main():
+    # Identité visuelle affichée avant toute demande de masterkey.
+    from startup_splash import (show_startup_splash, is_first_launch,
+                                mark_first_launch_complete)
+    first_launch = is_first_launch()
+    if not show_startup_splash(first_launch=first_launch):
+        print("\n  ◈ CRYPTO COLD WALLET  ·  By Красимир\n")
+        if first_launch:
+            print("  Welcome to @Красимир_Cold Wallet")
+            print("  You are responsible for the assets in your wallet.")
+            print("  No one else can control them without your permission.\n")
+    if first_launch:
+        choose_initial_language()
+        mark_first_launch_complete()
+    wm = load_wm()
+    master_pw = unlock_master()
+    while True:
+        clear_terminal()
+        print("\n" + "=" * 50)
+        print("  " + t("menu_title") + "  " + LANG_FLAGS.get(get_lang(), ""))
+        print("=" * 50)
+        _menu_options = [
+            ("opt_create",   "🆕"),   # créer un wallet
+            ("opt_balances", "💰"),   # soldes
+            ("opt_transfer", "💸"),   # transfert
+            ("opt_history",  "📜"),   # historique
+            ("opt_exchange", "💱"),   # échange / convertisseur
+            ("opt_decrypt",  "🔓"),   # déchiffrer
+            ("opt_delete",   "🗑️"),   # supprimer
+            ("opt_tor",      "📶"),   # réseau (Tor/Web/couper)
+            ("opt_lang",     "🌐"),   # langue
+            ("opt_beneficiaries", "📬"),   # destinataires (10)
+            ("opt_beta",     "🧪"),   # contact / retours Beta (11)
+            ("opt_about",    "ℹ️"),   # à propos (12), juste avant Sortie
+            ("opt_debug",    "🛠️"),   # diagnostics / rapport (13)
+            ("opt_update",   "🔄"),   # mise à jour (14)
+            ("opt_quit",     "🚪"),   # quitter
+        ]
+        for _key, _icon in _menu_options:
+            print("  " + pad_display(t(_key), PAD_OPT) + _icon)
+        print("─" * 50)
+        choix = input(t("choice_prompt")).strip()
+        if choix == "1":
+            menu_create(master_pw)
+        elif choix == "2":
+            menu_show_balances(master_pw)
+            input("\n  " + t("about_back"))
+        elif choix == "3":
+            menu_transfer(master_pw)
+        elif choix == "4":
+            menu_show_history(master_pw)
+        elif choix == "5":
+            menu_exchange(master_pw)
+        elif choix == "6":
+            menu_decrypt(master_pw)
+        elif choix == "7":
+            menu_delete(master_pw)
+        elif choix == "8":
+            menu_reseau(master_pw)
+        elif choix == "9":
+            menu_lang()
+        elif choix == "10":
+            menu_beneficiaires(master_pw)
+        elif choix == "11":
+            menu_beta()
+        elif choix == "12":
+            menu_about()
+        elif choix == "13":
+            menu_debug(master_pw)
+        elif choix == "14":
+            menu_update()
+        elif choix == "0":
+            tor_stop()  # laisse proprement le démon Tor (si actif)
+            print("  " + t("bye")); break
+        else:
+            print("  " + t("invalid_choice"))
+
+
+def menu_lang():
+    """Sous-menu Langue (option 9 du menu principal).
+    Permet de changer la langue à tout moment ; le choix est persistant
+    (lang.txt) et s'applique immédiatement à tout le menu."""
+    # Drapeau unicode associé à chaque code de langue (affiché à droite)
+    LANG_FLAGS = {
+        "fr": "🇫🇷", "en": "🇬🇧", "es": "🇪🇸", "ru": "🇷🇺",
+        "zh": "🇨🇳", "ar": "🇸🇦", "he": "🇮🇱",
+        "de": "🇩🇪", "it": "🇮🇹", "pt": "🇵🇹", "ja": "🇯🇵",
+        "ko": "🇰🇷", "nl": "🇳🇱", "pl": "🇵🇱", "tr": "🇹🇷",
+    }
+    while True:
+        print("\n" + "─" * 50)
+        print("  " + t("lang_title"))
+        print("─" * 50)
+        for code in LANGS:
+            marker = "●" if code == get_lang() else " "
+            print(f"  {marker} {code}  {pad_display(LANGS[code], PAD_LANG)} {LANG_FLAGS.get(code, '')}")
+        print("─" * 50)
+        print("  " + t("lang_current") + LANGS[get_lang()] + f" ({get_lang()})")
+        code = input("  " + t("lang_choose")).strip().lower()
+        if code == "0":
+            return
+        if set_lang(code):
+            # Réaffiche le message de confirmation dans la NOUVELLE langue
+            print("  " + t("lang_set") + LANGS[get_lang()] + f" ({get_lang()}).")
+        else:
+            print("  " + t("lang_unknown"))
+
+
+def choose_initial_language():
+    flags = {"fr":"🇫🇷","en":"🇬🇧","es":"🇪🇸","ru":"🇷🇺","zh":"🇨🇳","ar":"🇸🇦","he":"🇮🇱","de":"🇩🇪","it":"🇮🇹","pt":"🇵🇹","ja":"🇯🇵","ko":"🇰🇷","nl":"🇳🇱","pl":"🇵🇱","tr":"🇹🇷"}
+    print("\n  Choose your language / Choisissez votre langue")
+    for idx, code in enumerate(LANGS, 1):
+        print(f"  {idx}) {LANGS[code]} {flags.get(code, '')}")
+    while True:
+        raw = input("  Language: ").strip().lower()
+        if raw.isdigit() and 1 <= int(raw) <= len(LANGS):
+            raw = list(LANGS)[int(raw) - 1]
+        if raw in LANGS:
+            set_lang(raw)
+            print("  " + t("lang_set") + LANGS[raw] + f" ({raw}).")
+            return raw
+        print("  Invalid language choice / Choix invalide.")
+
+
+def menu_beneficiaires(master_pw: str):
+    if not access.verify_secondary(master_pw):
+        return
+    """Sous-menu Bénéficiaires (option 10). Permet de voir, ajouter ou supprimer des destinataires."""
+    import beneficiaries_manager as _bm
+
+    def _load_beneficiaries():
+        try:
+            return _bm.load_beneficiaries(master_pw)
+        except Exception as e:
+            print("  [!] Carnet chiffré illisible : " + str(e))
+            return {}
+
+    def _save_beneficiaries(data):
+        try:
+            _bm.save_beneficiaries(data, master_pw)
+        except Exception as e:
+            print("  [!] Erreur sauvegarde chiffrée : " + str(e))
+
+    def _menu_list_destinataires():
+        """Affiche tous les destinataires avec numérotation (nom + prénom)."""
+        benefs = _load_beneficiaries()
+        if not benefs:
+            print("  " + t("ben_empty"))
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+
+        print("\n  " + t("ben_list_title"))
+        print("─" * 50)
+        for idx, label in enumerate(sorted(benefs.keys()), 1):
+            info = benefs[label]
+            nom = info.get("nom", "?")
+            prenom = info.get("prenom", "?")
+            nb_wallets = len(info.get("wallets", []))
+            print(f"  {idx}) {label:<25} | {prenom:<10} {nom:<15} | {nb_wallets} wallet(s)")
+        print("─" * 50)
+        input("  Appuyez sur Entrée pour continuer...")
+
+    def _menu_add_destinataire():
+        """Formulaire d'ajout d'un destinataire avec multi-wallet."""
+        print("\n  " + t("ben_add"))
+        print("─" * 50)
+
+        prenom = input("  " + t("ben_add_prompt_prenom")).strip()
+        if not prenom:
+            print("  [!] Prénom requis.")
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+
+        nom = input("  " + t("ben_add_prompt_nom")).strip()
+        if not nom:
+            print("  [!] Nom requis.")
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+
+        pseudo = input("  " + t("ben_add_prompt_pseudo")).strip()
+
+        label = f"{prenom} {nom}"
+        wallets = []
+
+        add_wallet = input("  Souhaitez-vous ajouter un wallet ? (oui/non) : ").strip().lower()
+        if add_wallet not in {"oui", "o", "yes", "y"}:
+            wallets = []
+        while add_wallet in {"oui", "o", "yes", "y"}:
+            print("\n  ── Nouveau wallet ──")
+            adresse = input("  " + t("ben_add_prompt_adresse")).strip()
+            if not adresse:
+                print("  [!] Adresse requise.")
+                input("  Appuyez sur Entrée pour continuer...")
+                return
+
+            devise = input("  " + t("ben_add_prompt_devise")).strip().upper()
+            if not devise:
+                print("  [!] Devise requise.")
+                input("  Appuyez sur Entrée pour continuer...")
+                return
+
+            print("  Réseaux disponibles :")
+            networks = list(dict.fromkeys(spec["network"] for spec in ASSETS.values()))
+            for number, network in enumerate(networks, 1):
+                print(f"    {number}) {network_icon(network)} {network}")
+            network_choice = input("  Numéro du réseau : ").strip()
+            if not network_choice.isdigit() or not 1 <= int(network_choice) <= len(networks):
+                print("  [!] Réseau invalide.")
+                return
+            reseau = networks[int(network_choice) - 1]
+
+            plateforme = input("  " + t("ben_add_prompt_plateforme")).strip()
+            if not plateforme:
+                print("  [!] Plateforme requise.")
+                input("  Appuyez sur Entrée pour continuer...")
+                return
+
+            wallets.append({
+                "adresse": adresse,
+                "devise": devise,
+                "reseau": reseau,
+                "plateforme": plateforme,
+            })
+
+            print("  " + t("ben_save_success"))
+
+            add_wallet = input("  Ajouter un autre wallet ? (oui/non) : ").strip().lower()
+
+        benefs = _load_beneficiaries()
+        benefs[label] = {
+            "prenom": prenom,
+            "nom": nom,
+            "pseudonyme": pseudo,
+            "wallets": wallets,
+        }
+        _save_beneficiaries(benefs)
+        print("  ✅ Bénéficiaire sauvegardé : " + label)
+        input("  Appuyez sur Entrée pour continuer...")
+
+    def _menu_consulter_beneficiaire(label: str):
+        """Affiche tous les wallets enregistrés d'un bénéficiaire."""
+        benefs = _load_beneficiaries()
+        wallets = benefs.get(label, {}).get("wallets", [])
+        print("\n  ── Wallets de " + label + " ──")
+        print("─" * 50)
+        if wallets:
+            for j, w in enumerate(wallets, 1):
+                print(f"  {j}) {icon_cell(w['devise'])} {w['devise']:<10} | "
+                      f"{pad_display(network_icon(w['reseau']), 2)} {w['reseau']:<8} | "
+                      f"{w['adresse'][:40]:<40} | {w['plateforme']}")
+        else:
+            print("  Aucun wallet enregistré.")
+        print("─" * 50)
+        input("  Appuyez sur Entrée pour continuer...")
+
+    def _menu_modifier_beneficiaire(label: str):
+        """Sous-menu de modification : changer identité, ajouter wallet, supprimer wallet."""
+        while True:
+            print("\n  " + t("ben_modify_title"))
+            print("─" * 50)
+            print("  1) " + t("ben_modify_change_identity"))
+            print("  2) Wallets")
+            print("  3) Supprimer ce bénéficiaire")
+            print("  0) " + t("ben_back"))
+            print("─" * 50)
+            choix = input("  " + t("ben_prompt_choix") + " : ").strip()
+            if choix == "1":
+                _menu_changer_identite(label)
+            elif choix == "2":
+                print("  1) Ajouter un wallet enregistré")
+                print("  2) Supprimer un wallet enregistré")
+                sous = input("  Choix : ").strip()
+                if sous == "1":
+                    _menu_ajouter_wallet(label)
+                elif sous == "2":
+                    _menu_supprimer_wallet_par_numero(label)
+            elif choix == "3":
+                confirm = input(f"  Supprimer définitivement {label} ? (oui/non) : ").strip().lower()
+                if confirm in {"oui", "o", "yes", "y"}:
+                    benefs = _load_beneficiaries()
+                    benefs.pop(label, None)
+                    _save_beneficiaries(benefs)
+                    print("  ✅ Bénéficiaire supprimé.")
+                    return
+                print("  Suppression annulée.")
+            elif choix == "0":
+                return
+            else:
+                print("  " + t("ben_invalid"))
+
+    def _menu_changer_identite(label: str):
+        """Change le prénom et nom d'un bénéficiaire."""
+        benefs = _load_beneficiaries()
+        info = benefs.get(label)
+        if not info:
+            print("  [!] Bénéficiaire introuvable.")
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+        print("\n  ── Changer l'identité de " + label + " ──")
+        old_prenom = info.get("prenom", "")
+        old_nom = info.get("nom", "")
+        print("  Prénom actuel : " + old_prenom)
+        new_prenom = input("  " + t("ben_add_prompt_prenom")).strip()
+        if not new_prenom:
+            new_prenom = old_prenom
+        print("  Nom actuel : " + old_nom)
+        new_nom = input("  " + t("ben_add_prompt_nom")).strip()
+        if not new_nom:
+            new_nom = old_nom
+        new_label = f"{new_prenom} {new_nom}"
+        wallets = info.get("wallets", [])
+        old_pseudo = info.get("pseudonyme", "")
+        new_pseudo = input("  Pseudonyme (laisser vide pour garder '" + old_pseudo + "') : ").strip()
+        if not new_pseudo:
+            new_pseudo = old_pseudo
+        benefs.pop(label)
+        benefs[new_label] = {
+            "prenom": new_prenom,
+            "nom": new_nom,
+            "pseudonyme": new_pseudo,
+            "wallets": wallets,
+        }
+        _save_beneficiaries(benefs)
+        print("  ✅ Identité mise à jour : " + new_label)
+        input("  Appuyez sur Entrée pour continuer...")
+
+    def _menu_ajouter_wallet(label: str):
+        """Ajoute un wallet à un bénéficiaire existant (chaîne complète : adresse → réseau → plateforme)."""
+        benefs = _load_beneficiaries()
+        info = benefs.get(label)
+        if not info:
+            print("  [!] Bénéficiaire introuvable.")
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+        print("\n  ── Ajouter un wallet à " + label + " ──")
+        wallets = info.get("wallets", [])
+        print("  " + t("ben_add"))
+        print("─" * 50)
+        adresse = input("  " + t("ben_add_prompt_adresse")).strip()
+        if not adresse:
+            print("  [!] Adresse requise.")
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+        devise = input("  " + t("ben_add_prompt_devise")).strip()
+        if not devise:
+            print("  [!] Devise requise.")
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+        plateforme = input("  " + t("ben_add_prompt_plateforme")).strip()
+        if not plateforme:
+            print("  [!] Plateforme requise.")
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+        reseau = input("  Réseau (ex: btc, eth, bsc, sol, ltc...) : ").strip().lower()
+        wallets.append({
+            "adresse": adresse,
+            "devise": devise,
+            "reseau": reseau,
+            "plateforme": plateforme,
+        })
+        info["wallets"] = wallets
+        benefs[label] = info
+        _save_beneficiaries(benefs)
+        print("  " + t("ben_save_success"))
+        print("  ✅ Wallet ajouté à " + label)
+        input("  Appuyez sur Entrée pour continuer...")
+
+    def _menu_supprimer_wallet_par_numero(label_override: str = None):
+        """Supprime un wallet spécifique d'un bénéficiaire par numéro (avec confirmation y/n).
+        Si label_override est fourni, on saute l'étape de choix du bénéficiaire."""
+        benefs = _load_beneficiaries()
+        if not benefs:
+            print("  " + t("ben_empty"))
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+
+        if label_override:
+            labels = [label_override]
+        else:
+            print("\n  " + t("ben_delete"))
+            print("─" * 50)
+            for idx, label_item in enumerate(sorted(benefs.keys()), 1):
+                info_item = benefs[label_item]
+                nom_item = info_item.get("nom", "?")
+                prenom_item = info_item.get("prenom", "?")
+                nb_item = len(info_item.get("wallets", []))
+                print(f"  {idx}) {label_item:<25} | {prenom_item} {nom_item} | {nb_item} wallet(s)")
+            print("─" * 50)
+            num = input("  Numéro du bénéficiaire : ").strip()
+            try:
+                idx = int(num) - 1
+                if idx < 0 or idx >= len(benefs):
+                    print("  [!] Numéro invalide.")
+                    input("  Appuyez sur Entrée pour continuer...")
+                    return
+            except ValueError:
+                print("  [!] Numéro invalide (entrez un nombre).")
+                input("  Appuyez sur Entrée pour continuer...")
+                return
+            labels = sorted(benefs.keys())
+            label_override = labels[idx]
+
+        label = label_override
+        wallets = benefs.get(label, {}).get("wallets", [])
+
+        if not wallets:
+            print("  [!] Aucun wallet pour ce bénéficiaire.")
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+
+        print("\n  ── Wallets de " + label + " ──")
+        print("─" * 50)
+        for j, w in enumerate(wallets, 1):
+            print(f"  {j}) {icon_cell(w['devise'])} {w['devise']:<10} | "
+                  f"{pad_display(network_icon(w['reseau']), 2)} {w['reseau']:<8} | "
+                  f"{w['adresse'][:40]:<40} | {w['plateforme']}")
+
+        num_w = input("  Numéro du wallet à supprimer : ").strip()
+        try:
+            idx_w = int(num_w) - 1
+            if idx_w < 0 or idx_w >= len(wallets):
+                print("  [!] Numéro invalide.")
+                input("  Appuyez sur Entrée pour continuer...")
+                return
+        except ValueError:
+            print("  [!] Numéro invalide (entrez un nombre).")
+            input("  Appuyez sur Entrée pour continuer...")
+            return
+
+        wallet_a_supprimer = wallets[idx_w]
+        print("\n  Supprimer ce wallet ?")
+        print(f"    Devise : {wallet_a_supprimer['devise']}")
+        print(f"    Réseau : {wallet_a_supprimer['reseau']}")
+        print(f"    Adresse : {wallet_a_supprimer['adresse']}")
+        print(f"    Plateforme : {wallet_a_supprimer['plateforme']}")
+        confirm = input("  " + t("ben_delete_confirm")).strip().lower()
+        if confirm == "oui" or confirm == "o" or confirm == "y":
+            del wallets[idx_w]
+            benefs[label]["wallets"] = wallets
+            _save_beneficiaries(benefs)
+            print("  " + t("ben_delete_done"))
+        else:
+            print("  Annulé.")
+
+        input("  Appuyez sur Entrée pour continuer...")
+
+    while True:
+        print("\n  " + t("ben_title"))
+        print("─" * 50)
+        print("  1) " + t("ben_add"))
+        print("  2) Modifier un destinataire")
+        print("  3) " + t("ben_modify_delete_wallet"))
+        print("  0) " + t("ben_back"))
+        print("─" * 50)
+        choix = input("  " + t("ben_prompt_choix") + " : ").strip()
+
+        if choix == "1":
+            _menu_add_destinataire()
+        elif choix == "2":
+            benefs = _load_beneficiaries()
+            if not benefs:
+                print("  " + t("ben_empty"))
+                input("  Appuyez sur Entrée pour continuer...")
+                continue
+            print("\n  " + t("ben_list_title"))
+            print("─" * 50)
+            for idx, label in enumerate(sorted(benefs.keys()), 1):
+                info = benefs[label]
+                nom = info.get("nom", "?")
+                prenom = info.get("prenom", "?")
+                nb = len(info.get("wallets", []))
+                pseudo = info.get("pseudonyme", "")
+                print(f"  {idx}) {label:<25} | {prenom} {nom} | {nb} wallet(s)")
+            print("─" * 50)
+            num = input("  Numéro du bénéficiaire : ").strip()
+            try:
+                idx = int(num) - 1
+                if idx < 0 or idx >= len(benefs):
+                    print("  [!] Numéro invalide.")
+                    input("  Appuyez sur Entrée pour continuer...")
+                    continue
+            except ValueError:
+                print("  [!] Numéro invalide (entrez un nombre).")
+                input("  Appuyez sur Entrée pour continuer...")
+                continue
+            labels = sorted(benefs.keys())
+            label = labels[idx]
+            _menu_modifier_beneficiaire(label)
+        elif choix == "3":
+            # Supprimer un bénéficiaire : numérotation, choix, confirmation, suppression intégrale
+            benefs = _load_beneficiaries()
+            if not benefs:
+                print("  " + t("ben_empty"))
+                input("  Appuyez sur Entrée pour continuer...")
+                continue
+            print("\n  " + t("ben_list_title"))
+            print("─" * 50)
+            for idx, label in enumerate(sorted(benefs.keys()), 1):
+                info = benefs[label]
+                nom = info.get("nom", "?")
+                prenom = info.get("prenom", "?")
+                nb = len(info.get("wallets", []))
+                print(f"  {idx}) {label:<25} | {prenom} {nom} | {nb} wallet(s)")
+            print("─" * 50)
+            num = input("  Numéro du bénéficiaire à supprimer : ").strip()
+            try:
+                idx = int(num) - 1
+                if idx < 0 or idx >= len(benefs):
+                    print("  [!] Numéro invalide.")
+                    input("  Appuyez sur Entrée pour continuer...")
+                    continue
+            except ValueError:
+                print("  [!] Numéro invalide (entrez un nombre).")
+                input("  Appuyez sur Entrée pour continuer...")
+                continue
+            labels = sorted(benefs.keys())
+            label = labels[idx]
+            info = benefs[label]
+            print("\n  ── Supprimer " + label + " ──")
+            print("  Prénom : " + info.get("prenom", ""))
+            print("  Nom    : " + info.get("nom", ""))
+            print("  Wallets : " + str(len(info.get("wallets", []))))
+            for j, w in enumerate(info.get("wallets", []), 1):
+                print(f"    {j}) {icon_cell(w['devise'])} {w['devise']:<10} | "
+                      f"{pad_display(network_icon(w['reseau']), 2)} {w['reseau']:<8} | "
+                      f"{w['adresse'][:40]:<40} | {w['plateforme']}")
+            print("─" * 50)
+            confirm = input("  " + t("ben_delete_confirm")).strip().lower()
+            if confirm == "oui" or confirm == "o" or confirm == "y":
+                del benefs[label]
+                _save_beneficiaries(benefs)
+                print("  " + t("ben_delete_done"))
+            else:
+                print("  Annulé.")
+            input("  Appuyez sur Entrée pour continuer...")
+        elif choix == "0":
+            return
+        else:
+            print("  " + t("ben_invalid"))
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+{
+  "format": 2,
+  "mode": "standard",
+  "kdf": "Argon2id",
+  "cipher": "AES-256-GCM",
+  "access_level": "easy"
+}

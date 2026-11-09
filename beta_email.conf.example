@@ -1,0 +1,9 @@
+# Exemple de configuration pour la rubrique Beta.
+# Ne pas publier un fichier contenant un mot de passe SMTP réel.
+export WALLET_BETA_EMAIL='votre-adresse-beta@example.com'
+export WALLET_BETA_SMTP_HOST='smtp.example.com'
+export WALLET_BETA_SMTP_PORT='587'
+export WALLET_BETA_SMTP_USER='votre-compte-smtp@example.com'
+export WALLET_BETA_SMTP_PASSWORD='mot-de-passe-application'
+export WALLET_BETA_SMTP_FROM='votre-compte-smtp@example.com'
+export WALLET_BETA_SMTP_SECURITY='starttls'
