@@ -1,0 +1,12 @@
+# Copiez ce fichier en gateway.conf et renseignez VOS identifiants
+# de la passerelle XMR (donnés par l'émetteur, en main propre).
+#
+# Format A (recommandé) : une seule ligne = le mot de passe
+#   (le login par défaut est 'xmrgw')
+# MotDePasseRecu
+#
+# Format B (si login différent) : deux lignes
+#   user=xmrgw
+#   pass=MotDePasseRecu
+#
+# NE PARTAGEZ PAS ce fichier. NE LE PUBLIEZ PAS.
